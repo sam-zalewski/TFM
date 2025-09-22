@@ -1,0 +1,6657 @@
+---
+title: "Kalman"
+output: html_document
+date: "2025-02-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+
+
+
+# Automatic Scripts
+
+
+```{r}
+
+### ADJUST TO LOCATION OF TWO KALMAN FILTER FILES
+setwd("C:/Users/SamZalewski/Documents/TFM")
+
+
+library(dplyr)
+library(ggplot2)
+library(MASS)
+
+# sim_data <- simulate_flight(x0, n_steps, Q)
+simulate_flight <- function(x0, n_steps, Q) {  #constant acceleration nmodel
+  dt <- 1
+  
+  
+  Q_sim <- matrix(0, nrow = 6, ncol = 6)
+  
+  Q_sim[3, 3] <- Q[3, 3]  # ax variance
+  Q_sim[6, 6] <- Q[6, 6]  # ay variance
+
+    
+  F <- matrix(c(
+    1, dt, 0.5*dt^2, 0,  0,        0,
+    0,  1,       dt, 0,  0,        0,
+    0,  0,        1, 0,  0,        0,
+    0,  0,        0, 1, dt, 0.5*dt^2,
+    0,  0,        0, 0,  1,       dt,
+    0,  0,        0, 0,  0,        1
+  ), nrow = 6, byrow = TRUE)
+
+  state <- matrix(NA, nrow = n_steps, ncol = length(x0)) 
+  state[1, ] <- x0
+
+  noise <- MASS::mvrnorm(n_steps - 1, mu = rep(0, 6), Sigma = Q_sim) #add in noise
+
+  for (k in 2:n_steps) {
+    state[k, ] <- F %*% state[k - 1, ] + noise[k - 1, ]
+  }
+
+  return(data.frame(
+    time = 1:n_steps,
+    px = state[, 1],
+    vx = state[, 2],
+    ax = state[, 3],
+    py = state[, 4],
+    vy = state[, 5],
+    ay = state[, 6]
+  ))
+}
+
+
+
+add_noise <- function(sim_data, R_tri, R_radar,skewness = 0, normality_weight = 1) {
+  library(sn)
+  
+  px <- sim_data$px
+  py <- sim_data$py
+  n <- length(px)
+
+  gen_noise <- function(sd, n, skewness, normality_weight) {
+  alpha <- skewness
+  delta <- alpha / sqrt(1 + alpha^2)
+
+  omega <- sd / sqrt(1 - (2 * delta^2 / pi))
+  xi <- -omega * delta * sqrt(2 / pi)
+
+  skew_part <- rsn(n, xi = xi, omega = omega, alpha = alpha)
+
+  if (normality_weight < 1) {
+    range <- sqrt(12 * sd^2 * (1 - normality_weight^2) / (1 - normality_weight)^2)
+    unif_part <- runif(n, min = -range / 2, max = range / 2)
+  } else {
+    unif_part <- rep(0, n)
+  }
+
+  normality_weight * skew_part + (1 - normality_weight) * unif_part
+}
+
+  d1 <- sqrt((px + 600)^2 + py^2) + gen_noise(sqrt(R_tri[1, 1]), n, skewness, normality_weight)
+  d2 <- sqrt((px - 600)^2 + py^2) + gen_noise(sqrt(R_tri[2, 2]), n, skewness, normality_weight)
+  d  <- sqrt(px^2 + py^2)         + gen_noise(sqrt(R_radar[1, 1]), n, skewness, normality_weight)
+  theta <- atan2(py, px)         + gen_noise(sqrt(R_radar[2, 2]), n, skewness, normality_weight)
+
+  sim_data$d1 <- d1
+  sim_data$d2 <- d2
+  sim_data$d  <- d
+  sim_data$theta <- theta
+
+  return(sim_data)
+}
+
+
+compute_metrics <- function(true_x, true_y, estimated_x, estimated_y){
+  mae  <- mean(sqrt((estimated_x - true_x)^2 + (estimated_y - true_y)^2))
+  mse <- mean((estimated_x - true_x)^2 + (estimated_y - true_y)^2)
+  mape <- mean(abs((estimated_x - true_x)/true_x + (estimated_y - true_y)/true_y))*100
+  return(c(MAE=mae, RMSE=rmse, MAPE=mape))
+}
+
+
+
+source("EKF_all_groundup.R")
+source("EKF_all_groundup.R")
+source("UKF_all_groundup_2.R")
+
+run_EKF <- function(sim_data, trilateration = FALSE, alpha=0, Q, R, x0) {
+  dt <- 1
+  
+  library(numDeriv)
+  
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],
+      x[2] + dt * x[3],
+      x[3],
+      x[4] + x[5] * dt + 0.5 * dt^2 * x[6],
+      x[5] + dt * x[6],
+      x[6]
+    )
+  }
+  
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2, 0,
+      dt, 0,
+      1, 0,
+      0, (dt^2)/2,
+      0, dt,
+      0, 1
+    ), nrow = 6, byrow = TRUE)
+  }
+  
+  
+  P0 <- diag(rep(1, 6))   # Initial covariance
+  
+ 
+    d1 <- sim_data$d1
+    d2 <- sim_data$d2
+    y <- t(as.matrix(cbind(d1, d2)))
+    
+    h <- function(x) {
+      px <- x[1]
+      py <- x[4]
+      c(sqrt((px + 600)^2 + py^2),sqrt((px - 600)^2 + py^2))
+    }
+    
+  
+  
+  result <- extendedkalmanf_all(y, f, B, Q, h, R, x0, P0, alpha)
+  
+  list(x = result$x.f[1, ], y = result$x.f[4, ])
+}
+
+source("UKF_all_groundup_newweights.R")
+source("UKF_scalingQ.R")
+
+
+run_UKF <- function(sim_data, alpha =1, beta =0, kappa=2, Q, R, x0) {
+  
+  library(numDeriv)
+
+  dt <- 1
+  
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],  # x position
+      x[2] + dt * x[3],                      # x velocity
+      x[3],                                  # x acceleration
+      x[4] + x[5] * dt + 0.5 * dt^2 * x[6],  # y position
+      x[5] + dt * x[6],                      # y velocity
+      x[6]                                   # y acceleration
+    )
+  }
+  
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2, 0,
+      dt, 0,
+      1, 0,
+      0, (dt^2)/2,
+      0, dt,
+      0, 1
+    ), nrow = 6, byrow = TRUE)
+  }
+  
+  d1 <- sim_data$d1
+  d2 <- sim_data$d2
+  y <- t(as.matrix(cbind(d1, d2)))
+    
+  h <- function(x) {
+      px <- x[1]
+      py <- x[4]
+      c(
+        sqrt((px + 600)^2 + py^2),
+        sqrt((px - 600)^2 + py^2)
+      )
+  }
+  
+  P0 <- diag(rep(1, 6))
+
+  result <- unscentedkalmanf_all_newweights(y, f, B, Q, h, R, x0, P0, alpha, beta, kappa)
+  
+  list(x = result$x.f[1, ], y = result$x.f[4, ])
+}
+
+  source("EKF_all_groundup.R")
+run_EKF_radar <- function(sim_data, alpha = 0.003, Q, R, x0) {
+  dt <- 1
+
+  library(numDeriv)
+
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],
+      x[2] + dt * x[3],
+      x[3],
+      x[4] + x[5] * dt + 0.5 * dt^2 * x[6],
+      x[5] + dt * x[6],
+      x[6]
+    )
+  }
+
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2, 0,
+      dt, 0,
+      1, 0,
+      0, (dt^2)/2,
+      0, dt,
+      0, 1
+    ), nrow = 6, byrow = TRUE)
+  }
+
+  P0 <- diag(rep(1, 6))
+
+  d <- sim_data$d
+  theta <- sim_data$theta
+  y <- t(as.matrix(cbind(d, theta)))
+
+  h <- function(x) {
+    px <- x[1]
+    py <- x[4]
+    d <- sqrt(px^2 + py^2)
+    theta <- atan2(py, px)
+    c(d, theta)
+  }
+
+  result <- extendedkalmanf_all(y, f, B, Q, h, R, x0, P0, alpha)
+
+  list(x = result$x.f[1, ], y = result$x.f[4, ])
+}
+
+
+source("UKF_all_groundup_newweights.R")
+
+run_UKF_radar <- function(sim_data, alpha = 0.003, beta = 2, kappa = -3, Q, R, x0) {
+  library(numDeriv)
+  dt <- 1
+
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],
+      x[2] + dt * x[3],
+      x[3],
+      x[4] + x[5] * dt + 0.5 * dt^2 * x[6],
+      x[5] + dt * x[6],
+      x[6]
+    )
+  }
+
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2, 0,
+      dt, 0,
+      1, 0,
+      0, (dt^2)/2,
+      0, dt,
+      0, 1
+    ), nrow = 6, byrow = TRUE)
+  }
+
+  P0 <- diag(rep(1, 6))
+
+  d <- sim_data$d
+  theta <- sim_data$theta
+  
+
+  
+  y <- t(as.matrix(cbind(d, theta)))
+
+  h <- function(x) {
+    px <- x[1]
+    py <- x[4]
+    d <- sqrt(px^2 + py^2)
+    theta <- atan2(py, px)
+    c(d, theta)
+  }
+
+  result <- unscentedkalmanf_all_newweights(y, f, B, Q, h, R, x0, P0, alpha, beta, kappa)
+
+  list(x = result$x.f[1, ], y = result$x.f[4, ])
+}
+  source("UKF_augmented.R")
+
+run_UKF_aug <- function(sim_data, alpha =1, beta =0, kappa=2, Q, R, x0) {
+
+  library(numDeriv)
+
+  dt <- 1
+  
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],  # x position
+      x[2] + dt * x[3],                      # x velocity
+      x[3],                                  # x acceleration
+      x[4] + x[5] * dt + 0.5 * dt^2 * x[6],  # y position
+      x[5] + dt * x[6],                      # y velocity
+      x[6]                                   # y acceleration
+    )
+  }
+  
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2, 0,
+      dt, 0,
+      1, 0,
+      0, (dt^2)/2,
+      0, dt,
+      0, 1
+    ), nrow = 6, byrow = TRUE)
+  }
+  
+  d1 <- sim_data$d1
+  d2 <- sim_data$d2
+  y <- t(as.matrix(cbind(d1, d2)))
+    
+  h <- function(x) {
+      px <- x[1]
+      py <- x[4]
+      c(
+        sqrt((px + 600)^2 + py^2),
+        sqrt((px - 600)^2 + py^2)
+      )
+  }
+  
+  P0 <- diag(rep(1, 6))
+
+  result <- UKF_augmented(y, f, Q, h, R, x0, P0, alpha, beta, kappa)
+  
+  list(x = result$x.f[1, ], y = result$x.f[4, ])
+}
+
+  source("UKF_augmented.R")
+
+run_UKF_aug_radar <- function(sim_data, alpha = 0.003, beta = 2, kappa = -3, Q, R, x0) {
+
+  library(numDeriv)
+  dt <- 1
+
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],
+      x[2] + dt * x[3],
+      x[3],
+      x[4] + x[5] * dt + 0.5 * dt^2 * x[6],
+      x[5] + dt * x[6],
+      x[6]
+    )
+  }
+
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2, 0,
+      dt, 0,
+      1, 0,
+      0, (dt^2)/2,
+      0, dt,
+      0, 1
+    ), nrow = 6, byrow = TRUE)
+  }
+  
+  
+
+  P0 <- diag(rep(1, 6))
+
+  d <- sim_data$d
+  theta <- sim_data$theta
+  
+
+  
+  y <- t(as.matrix(cbind(d, theta)))
+
+  h <- function(x) {
+    px <- x[1]
+    py <- x[4]
+    d <- sqrt(px^2 + py^2)
+    theta <- atan2(py, px)
+    c(d, theta)
+  }
+
+  result <- UKF_augmented(y, f, Q, h, R, x0, P0, alpha, beta, kappa)
+
+  list(x = result$x.f[1, ], y = result$x.f[4, ])
+}
+
+
+run_UKF_dynamicQ <- function(sim_data, alpha =1, beta =0, kappa=2, Q, R, x0) {
+  
+  library(numDeriv)
+
+  dt <- 1
+  
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],  # x position
+      x[2] + dt * x[3],                      # x velocity
+      x[3],                                  # x acceleration
+      x[4] + x[5] * dt + 0.5 * dt^2 * x[6],  # y position
+      x[5] + dt * x[6],                      # y velocity
+      x[6]                                   # y acceleration
+    )
+  }
+  
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2, 0,
+      dt, 0,
+      1, 0,
+      0, (dt^2)/2,
+      0, dt,
+      0, 1
+    ), nrow = 6, byrow = TRUE)
+  }
+  
+  d1 <- sim_data$d1
+  d2 <- sim_data$d2
+  y <- t(as.matrix(cbind(d1, d2)))
+    
+  h <- function(x) {
+      px <- x[1]
+      py <- x[4]
+      c(
+        sqrt((px + 600)^2 + py^2),
+        sqrt((px - 600)^2 + py^2)
+      )
+  }
+  
+  P0 <- diag(rep(1, 6))
+
+  result <- unscentedkalmanf_all_newweights_scalingQ(y, f, B, Q, h, R, x0, P0, alpha, beta, kappa)
+  
+  list(x = result$x.f[1, ], y = result$x.f[4, ])
+}
+
+```
+
+
+
+## Individual graph
+
+```{r}
+
+source("UKF_all_groundup_newweights.R")
+
+#R_scales <- seq(0.1, 1, length.out = 10)
+#sigma_as <- seq(0.01, 0.03, length.out = 10)
+
+
+
+dt <- 1  #time step always set to 1
+n_simulations <- 10
+n_steps <- 80
+x0 <- c(-200, 2, 0,  #px, vx, ax
+        2000, 5, 0)  # py, vy, ay
+
+
+
+x0 <- c(-200, 4, 0, 200, 0, 0)  # py, vy, ay
+
+R_scale <- 4  #measurement noise
+Q_scale <- 5 #process noise
+Sig <- 0.1
+
+Q_prop <- 0.5
+
+sigma_a <- 0.01 #acceleration noise std dev
+
+
+q <- sigma_a^2
+
+
+q <-0.5
+
+
+Q_block <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) 
+
+Q <- matrix(0, nrow = 6, ncol = 6)
+Q[1:3, 1:3] <- Q_block  # x position, velocity, acceleration
+Q[4:6, 4:6] <- Q_block  # y position, velocity, acceleration
+
+results <- data.frame()
+Q = Q*q
+Q_diag <- diag(c(0, 0, sigma_a^2, 0, 0, sigma_a^2))
+
+  repeat {
+  sim_data <- simulate_flight(x0, n_steps, Q_diag)
+  if (all(sim_data$py > 0)) break 
+    }
+
+  px <- sim_data$px
+  py <- sim_data$py
+
+  R_tri <- diag(c(50, 50)) * R_scale
+  R_radar <- diag(c(50, 0.00005)) * R_scale
+
+  sim_data_noisy <- add_noise(sim_data, R_tri, R_radar, skewness = 0, normality_weight = 1)
+  
+  Q_matrix <- Q + diag(0.5,6)
+  Q_matrix <- Q 
+  Q_matrix <- matrix(1,6,6) *25
+
+
+Q_KF <- diag(c(1,1,1,1,1,1)) * sigma_a * 10
+  
+#result <- run_UKF_radar(sim_data_noisy, alpha = 0.003, beta = 0, kappa = 0, Q = Q_matrix, R=  R_radar, x0=x0)
+result <- run_UKF(sim_data_noisy, alpha = 0.0001, beta = 2, kappa = 0, Q = Q_KF, R= R_tri, x0=x0)
+#result <- run_EKF(sim_data_noisy,alpha = 0.1, Q = Q_KF, R=  R_tri, x0=x0)
+
+#result <- run_UKF_aug(sim_data_noisy, alpha = 0.003, beta = 0, kappa = 0, Q = Q_matrix, R=R_tri, x0=x0)
+
+
+
+true_x <- sim_data$px
+true_y <- sim_data$py
+
+# Filtered (estimated) X and Y
+filtered_x <- result$x
+filtered_y <- result$y
+
+
+triangulate_position <- function(d1, d2) {
+  px <- (d1^2 - d2^2) / 2400
+  inside_sqrt <- d1^2 - (px + 600)^2
+  py <- ifelse(inside_sqrt >= 0, sqrt(inside_sqrt), NA)  # Positive root (object above x-axis)
+  return(c(px, py))
+}
+
+positions <- mapply(triangulate_position, sim_data_noisy$d1, sim_data_noisy$d2)
+
+measured_x <- positions[1, ]  
+measured_y <- positions[2, ]
+
+
+plot_df <- data.frame(
+  True_X = true_x,
+  True_Y = true_y,
+  Filtered_X = filtered_x,
+  Filtered_Y = filtered_y,
+  Measured_X = measured_x,
+  Measured_Y = measured_y,
+  Time = sim_data$time  # for reference if needed
+)
+
+
+library(ggplot2)
+ggplot() +
+  geom_path(data = plot_df, aes(x = True_X, y = True_Y, color = "True Trajectory"), linetype = "dotted", size = 1) +
+  geom_path(data = plot_df, aes(x = Filtered_X, y = Filtered_Y, color = "Filtered Trajectory"), size = 1) +
+  geom_point(data = plot_df, aes(x = Measured_X, y = Measured_Y, color = "Measurements"), shape = 4, size = 2) +  
+  labs(
+    #title = "Observed, True, and Estimated Trajectory",
+    x = "X Position",
+    y = "Y Position",
+    color = "Legend"
+  ) +
+  
+  scale_color_manual(values = c(
+    "True Trajectory" = "black",
+    "Filtered Trajectory" = "blue",
+    "Measurements" = "red"
+  )) +
+  
+  theme_minimal() +
+  theme(legend.position = "right")
+
+
+
+mse_triangle <- mean((filtered_x - true_x)^2 + (filtered_y - true_y)^2)
+mse_triangle
+
+
+```
+
+```{r}
+Q1 <- Q1 + ggtitle("High Process, Low Measurement") +  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+
+Q2 <- Q2 + ggtitle("High Process, High Measurement") +  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+
+Q3 <- Q3 + ggtitle("Low Process, Low Measurement") +  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+
+Q4 <- Q4 + ggtitle("Low Process, High Measurement") +  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+```
+
+
+```{r}
+library(patchwork)
+
+final_plot <- (Q1 | Q2) /
+              (Q3 | Q4)
+
+final_plot + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+```
+
+
+
+
+# 4x4 grid
+
+```{r}
+library(patchwork)  # for 2x2 plotting layout
+
+dt <- 1
+n_steps <- 100
+x0 <- c(-200, 2, 0, 2000, 5, 0)
+sigma_a <- 0.05
+q <- sigma_a^2
+
+
+Q_diag <- diag(c(0, 0, sigma_a^2, 0, 0, sigma_a^2))
+
+
+sim_list <- list()
+for (i in 1:4) {
+  repeat {
+    sim_data <- simulate_flight(x0, n_steps, Q_diag)
+    if (all(sim_data$py > 0)) break
+  }
+  sim_data$SimID <- paste("Trajectory", i)
+  sim_list[[i]] <- sim_data
+}
+
+
+plot_data <- bind_rows(sim_list)
+
+
+ggplot(plot_data, aes(x = px, y = py)) +
+  geom_point(color = "black", size = 1) +
+  facet_wrap(~ SimID, ncol = 2, scales = "free") +
+  xlab(NULL) +
+  ylab(NULL) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  )
+
+```
+
+```{r}
+ggplot(plot_data, aes(x = px, y = py)) +
+  geom_point(color = "black", size = 1) +
+  facet_wrap(~ SimID, ncol = 2, scales = "free") +
+  xlab(NULL) +
+  ylab(NULL) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  )
+```
+
+
+## Comparison
+
+```{r}
+
+dt <- 1  #time step always set to 1
+n_simulations <- 20
+n_steps <- 100
+x0 <- c(-200, 2, 0,  #px, vx, ax
+        2000, 5, 0)  # py, vy, ay
+
+R_scale <- 1  #measurement noise
+
+Sig <- 0.5
+sigma_a <- 0.5  #acceleration noise std dev
+
+q <- sigma_a^2
+
+Q_block <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+Q <- matrix(0, nrow = 6, ncol = 6)
+Q[1:3, 1:3] <- Q_block  # x position, velocity, acceleration
+Q[4:6, 4:6] <- Q_block  # y position, velocity, acceleration
+Q = Q*0.001
+
+
+results <- data.frame(
+  Simulation = integer(0),
+  Method = character(0),
+  MAE = numeric(0),
+  RMSE = numeric(0),
+  MAPE = numeric(0)
+)
+
+
+
+for(i in 1:n_simulations){
+  
+    repeat {  # simulate data, if simulation data cross the y-axis then it generates again
+  sim_data <- simulate_flight(x0, n_steps, Q)
+  if (all(sim_data$py > 0)) break 
+}
+
+  px <- sim_data$px
+  py <- sim_data$py
+
+  R_tri <- diag(c(50, 50)) * R_scale
+  R_radar <- diag(c(50, 0.00005)) * R_scale
+  
+
+  sim_data_noisy <- add_noise(sim_data, R_tri, R_radar, skewness = 0, normality_weight = 1)
+  
+
+
+  
+  Q_matrix <- diag(0.5,6)
+
+  
+  #ekf_result       <- run_EKF(sim_data_noisy, alpha = 0.003, Q = Q_matrix, R= R_tri, x0=x0)
+  ukf_result       <- run_UKF(sim_data_noisy, alpha = 0.003, beta = 0, kappa = 0, Q = Q_matrix, R=  R_tri, x0=x0)
+  #ekf_radar_result <- run_EKF_radar(sim_data_noisy, alpha = 0.003, Q = Q_matrix, R = R_radar, x0=x0)
+  ukf_radar_result <- run_UKF_radar(sim_data_noisy, alpha = 0.003, beta = 0, kappa = 0, Q = Q_matrix, R=  R_radar, x0=x0)
+  
+  ekf_result <- run_UKF_aug(sim_data_noisy, alpha = 0.003, beta = 0, kappa = 0, Q = Q_matrix, R=  R_tri, x0=x0)
+  ekf_radar_result <- run_UKF_aug_radar(sim_data_noisy, alpha = 0.003, beta = 0, kappa = 0, Q = Q_matrix, R=  R_radar, x0=x0)
+
+
+
+  ekf_metrics <- compute_metrics(sim_data$px, sim_data$py, ekf_result$x, ekf_result$y)
+  ukf_metrics <- compute_metrics(sim_data$px, sim_data$py, ukf_result$x, ukf_result$y)
+  
+    results <- rbind(results, data.frame(
+    Simulation = i,
+    Method     = c("EKF", "UKF", "EKF_Radar", "UKF_Radar"),
+    MAE        = c(
+      compute_metrics(sim_data$px, sim_data$py, ekf_result$x, ekf_result$y)["MAE"],
+      compute_metrics(sim_data$px, sim_data$py, ukf_result$x, ukf_result$y)["MAE"],
+      compute_metrics(sim_data$px, sim_data$py, ekf_radar_result$x, ekf_radar_result$y)["MAE"],
+      compute_metrics(sim_data$px, sim_data$py, ukf_radar_result$x, ukf_radar_result$y)["MAE"]
+    ),
+    RMSE       = c(
+      compute_metrics(sim_data$px, sim_data$py, ekf_result$x, ekf_result$y)["RMSE"],
+      compute_metrics(sim_data$px, sim_data$py, ukf_result$x, ukf_result$y)["RMSE"],
+      compute_metrics(sim_data$px, sim_data$py, ekf_radar_result$x, ekf_radar_result$y)["RMSE"],
+      compute_metrics(sim_data$px, sim_data$py, ukf_radar_result$x, ukf_radar_result$y)["RMSE"]
+    ),
+    MAPE       = c(
+      compute_metrics(sim_data$px, sim_data$py, ekf_result$x, ekf_result$y)["MAPE"],
+      compute_metrics(sim_data$px, sim_data$py, ukf_result$x, ukf_result$y)["MAPE"],
+      compute_metrics(sim_data$px, sim_data$py, ekf_radar_result$x, ekf_radar_result$y)["MAPE"],
+      compute_metrics(sim_data$px, sim_data$py, ukf_radar_result$x, ukf_radar_result$y)["MAPE"]
+    )
+  ))
+
+  
+  cat(sprintf("Simulation %d complete.\n", i))
+}
+
+
+results_summary <- results %>%
+  group_by(Method) %>%
+  summarise(
+    MAE = mean(MAE),
+    RMSE = mean(RMSE),
+    MAPE = mean(MAPE)
+  )
+
+print(results_summary)
+
+ggplot(results, aes(x=Method, y=RMSE, fill=Method))+
+  geom_boxplot()+
+  ggtitle("RMSE Comparison across simulations")+
+  theme_minimal()
+
+
+```
+
+
+
+
+
+
+### Grid Search across Q
+
+```{r}
+
+alpha_fixed <- 0.0001
+beta_fixed  <- 2
+kappa_fixed <- 0
+
+Q_multipliers <- seq(10, 100, length.out = 20)  # adjust range/resolution as needed
+
+
+q_results <- data.frame(
+  Q_multiplier = Q_multipliers,
+  mse = NA_real_
+)
+
+
+dt <- 1  #time step always set to 1
+n_simulations <- 10
+n_steps <- 100
+x0 <- c(-200, 2, 0,  #px, vx, ax
+        2000, 5, 0)  # py, vy, ay
+
+R_scale <- 0.1  #measurement noise
+
+Sig <- 0.5
+sigma_a <- 0.01  #acceleration noise std dev
+q <- sigma_a^2
+
+Q_block <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+Q <- matrix(0, nrow = 6, ncol = 6)
+Q[1:3, 1:3] <- Q_block  # x position, velocity, acceleration
+Q[4:6, 4:6] <- Q_block  # y position, velocity, acceleration
+
+
+
+
+
+evaluate_q_multiplier <- function(Q_multiplier, n_reps = 10) {
+  mse_vals <- numeric(n_reps)
+  
+  for (i in seq_len(n_reps)) {
+    sim_data <- simulate_flight(x0, n_steps, Q)
+    px <- sim_data$px
+    py <- sim_data$py
+
+    R_tri <- diag(c(50, 50)) * R_scale
+    R_radar <- diag(c(50, 0.00005)) * R_scale
+  
+    d1 <- sqrt((px + 600)^2 + py^2) + rnorm(length(px), mean = 0, sd = sqrt(R_tri[1,1]))
+    d2 <- sqrt((px - 600)^2 + py^2) + rnorm(length(px), mean = 0, sd = sqrt(R_tri[2,2]))
+  
+    d <- sqrt(px^2 + py^2) + rnorm(length(px), mean = 0, sd = sqrt(R_radar[1,1]))
+    theta <- atan2(py, px) + rnorm(length(px), mean = 0, sd = sqrt(R_radar[2,2]))
+
+    sim_data_noisy <- sim_data
+    sim_data_noisy$d1 <- d1
+    sim_data_noisy$d2 <- d2
+    sim_data_noisy$d <- d
+    sim_data_noisy$theta <- theta
+
+    result <- run_UKF(
+      sim_data_noisy,
+      alpha = alpha_fixed,
+      beta = beta_fixed,
+      kappa = kappa_fixed,
+      Q = Q * Q_multiplier,
+      R = R_tri,
+      x0 = x0
+    )
+    
+    mse_vals[i] <- mean((result$x - sim_data$px)^2 + (result$y - sim_data$py)^2)
+  }
+
+  return(mean(mse_vals, na.rm = TRUE))
+}
+
+for (i in seq_along(Q_multipliers)) {
+  multiplier <- Q_multipliers[i]
+  cat("Testing Q multiplier:", multiplier, "\n")
+  q_results$mse[i] <- evaluate_q_multiplier(multiplier, n_reps = 30)  # use 30+ for stable mse
+}
+
+
+best_q <- q_results[which.min(q_results$mse), ]
+print(best_q)
+
+ggplot(q_results, aes(x = Q_multiplier, y = mse)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    title = "UKF Performance vs Q Multiplier",
+    subtitle = "Lower mse indicates better performance",
+    x = "Q Multiplier",
+    y = "mse"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 12)
+  )
+
+```
+
+
+### Plotting
+
+```{r}
+ggplot(
+  results_grid %>% 
+    filter(Q_prop == 0.2) %>%
+    group_by(Method, R_scale) %>%
+    summarise(RMSE = mean(RMSE), .groups = "drop"),
+  aes(x = R_scale, y = RMSE, color = Method)
+) +
+  geom_line(size = 1.2) +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "R_scale vs RMSE",
+    x = "R_scale",
+    y = "RMSE"
+  )
+
+
+```
+
+
+
+
+
+```{r}
+library(dplyr)
+
+ggplot(
+  results_grid %>%
+    filter(near(R_scale, 1.9)) %>%
+    group_by(Method, Q_prop) %>%
+    summarise(RMSE = mean(RMSE), .groups = "drop"),
+  aes(x = Q_prop, y = RMSE, color = Method)
+) +
+  geom_line(size = 1.2) +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "Q_prop vs RMSE (R_scale = 1)",
+    x = "Q_prop",
+    y = "RMSE"
+  )
+
+```
+ # 3D
+
+```{r}
+library(plotly)
+
+library(tidyr)
+library(dplyr)
+library(reshape2)
+library(plotly)
+
+radar_diff_data <- results_grid %>%
+  filter(Method %in% c("EKF_Radar", "UKF_Radar")) %>%
+  group_by(Method, R_scale, Q_prop) %>%
+  summarise(RMSE = mean(RMSE), .groups = "drop") %>%
+  pivot_wider(names_from = Method, values_from = RMSE) %>%
+  mutate(Diff = EKF_Radar - UKF_Radar)
+
+diff_matrix <- acast(radar_diff_data, Q_prop ~ R_scale, value.var = "Diff")
+
+plot_ly(
+  x = sort(unique(radar_diff_data$R_scale)),
+  y = sort(unique(radar_diff_data$Q_prop)),
+  z = diff_matrix,
+  type = "surface",
+  colorscale = list(c(0, 'blue'), c(0.5, 'white'), c(1, 'red')),
+  zmin = min(diff_matrix, na.rm = TRUE),
+  zmax = max(diff_matrix, na.rm = TRUE)
+) %>%
+  layout(
+    title = "EKF_Radar - UKF_Radar RMSE Difference",
+    scene = list(
+      xaxis = list(title = "R_scale"),
+      yaxis = list(title = "Q_prop"),
+      zaxis = list(title = "RMSE Diff (EKF - UKF)")
+    )
+  )
+
+
+
+```
+
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Prepare difference data
+rmse_diff_data <- results_grid %>%
+  filter(Method %in% c("EKF_Radar", "UKF_Radar")) %>%
+  group_by(Method, Q_prop, R_scale) %>%
+  summarise(RMSE = mean(RMSE), .groups = "drop") %>%
+  pivot_wider(names_from = Method, values_from = RMSE) %>%
+  mutate(Diff = UKF_Radar - EKF_Radar)
+
+# Plot heatmap
+ggplot(rmse_diff_data, aes(x = R_scale, y = Q_prop, fill = Diff)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red",
+    midpoint = 0, name = "UKF - EKF"
+  ) +
+  labs(
+    title = "Heatmap of RMSE Difference (UKF_Radar - EKF_Radar)",
+    x = "R_scale",
+    y = "Q_prop"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+# UKF Grid Search
+
+```{r}
+
+
+alpha_vals <- seq(0.0001, 0.5, length.out = 5)
+beta_vals  <- seq(0, 2, length.out = 5)
+kappa_vals <- seq(0, 5, length.out = 5)
+
+param_grid <- expand.grid(alpha = alpha_vals, beta = beta_vals, kappa = kappa_vals)
+
+dt <- 1  #time step always set to 1
+n_simulations <- 10
+n_steps <- 100
+x0 <- c(-200, 2, 0,  #px, vx, ax
+        2000, 5, 0)  # py, vy, ay
+
+R_scale <- 0.2  #measurement noise
+Q_scale <- 1 #process noise
+Sig <- 0.5
+Q_prop <- 0.5
+
+sigma_a <- 0.05  #acceleration noise std dev
+
+
+q <- sigma_a^2
+
+Q_block <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+Q <- matrix(0, nrow = 6, ncol = 6)
+Q[1:3, 1:3] <- Q_block  # x position, velocity, acceleration
+Q[4:6, 4:6] <- Q_block  # y position, velocity, acceleration
+
+
+evaluate_param_combo <- function(alpha, beta, kappa, n_reps = 10) {
+  mse_vals <- numeric(n_reps)
+  for (i in seq_len(n_reps)) {
+    
+    sim_data <- simulate_flight(x0, n_steps, Q)
+    px <- sim_data$px
+    py <- sim_data$py
+
+    R_tri <- diag(c(50, 50)) * R_scale
+    R_radar <- diag(c(50, 0.00005)) * R_scale
+  
+    d1 <- sqrt((px + 600)^2 + py^2) + rnorm(length(px), mean = 0, sd = sqrt(R_tri[1,1]))
+    d2 <- sqrt((px - 600)^2 + py^2) + rnorm(length(px), mean = 0, sd = sqrt(R_tri[2,2]))
+  
+  
+  #create noies for radar
+  d <- sqrt(px^2 + py^2) + rnorm(length(px), mean = 0, sd = sqrt(R_radar[1,1]))
+  theta <- atan2(py, px) + rnorm(length(px), mean = 0, sd = sqrt(R_radar[2,2]))
+
+  sim_data_noisy <- sim_data
+  sim_data_noisy$d1 <- d1
+  sim_data_noisy$d2 <- d2
+  sim_data_noisy$d <- d
+  sim_data_noisy$theta <- theta
+    
+    #run_UKF(sim_data_noisy, alpha = 0.003, beta = 2, kappa= -3, Q=Q)
+    result <- run_UKF(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa,  R=  R_tri, Q=Q,x0=x0)
+    mse_vals[i] <- mean((result$x - sim_data$px)^2 + (result$y - sim_data$py)^2)
+  }
+  return(mean(mse_vals, na.rm = TRUE))
+}
+
+
+results <- param_grid
+results$mse <- NA
+ 
+for (i in seq_len(nrow(param_grid))) {
+  params <- param_grid[i, ]
+  cat("Evaluating:", i, "/", nrow(param_grid), 
+      "| alpha =", params$alpha, 
+      "| beta =", params$beta, 
+      "| kappa =", params$kappa, "\n")
+  
+  results$mse[i] <- evaluate_param_combo(
+    alpha = params$alpha,
+    beta = params$beta,
+    kappa = params$kappa,
+    n_reps = 40 
+  )
+}
+
+
+results_grid_search3 <-results 
+# Find best
+best_result <- results[which.min(results$mse), ]
+print(best_result)
+
+
+```
+
+
+### Finer Granularity
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# For alpha
+alpha_summary <- results_grid_search3 %>%
+  group_by(alpha) %>%
+  summarise(min_mse = min(mse, na.rm = TRUE),
+            max_mse = max(mse, na.rm = TRUE))
+
+# For beta
+beta_summary <- results_grid_search3 %>%
+  group_by(beta) %>%
+  summarise(min_mse = min(mse, na.rm = TRUE),
+            max_mse = max(mse, na.rm = TRUE))
+
+# For kappa
+kappa_summary <- results_grid_search3 %>%
+  group_by(kappa) %>%
+  summarise(min_mse = min(mse, na.rm = TRUE),
+            max_mse = max(mse, na.rm = TRUE))
+```
+
+```{r}
+ggplot(alpha_summary, aes(x = alpha)) +
+  geom_ribbon(aes(ymin = min_mse, ymax = max_mse), fill = "skyblue", alpha = 0.4) +
+  geom_line(aes(y = min_mse), color = "blue", size = 1) +
+  geom_line(aes(y = max_mse), color = "red", size = 1, linetype = "dashed") +
+  labs(title = "MSE Range vs Alpha", y = "RMSE", x = "Alpha") +
+  theme_minimal()
+
+
+```
+
+```{r}
+ggplot(beta_summary, aes(x = beta)) +
+  geom_ribbon(aes(ymin = min_rmse, ymax = max_rmse), fill = "lightgreen", alpha = 0.4) +
+  geom_line(aes(y = min_rmse), color = "green", size = 1) +
+  geom_line(aes(y = max_rmse), color = "darkred", size = 1, linetype = "dashed") +
+  labs(title = "RMSE Range vs Beta", y = "RMSE", x = "Beta") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(kappa_summary, aes(x = kappa)) +
+  geom_ribbon(aes(ymin = min_rmse, ymax = max_rmse), fill = "plum", alpha = 0.4) +
+  geom_line(aes(y = min_rmse), color = "purple", size = 1) +
+  geom_line(aes(y = max_rmse), color = "brown", size = 1, linetype = "dashed") +
+  labs(title = "RMSE Range vs Kappa", y = "RMSE", x = "Kappa") +
+  theme_minimal()
+```
+
+# Heatmap for R vs Q
+
+
+```{r}
+
+R_scales <- seq(0.05, 2, length.out = 15)
+sigma_as <- seq(0.01, 0.5, length.out = 15)
+param_grid <- expand.grid(R_scale = R_scales, sigma_a = sigma_as)
+
+
+dt <- 1
+n_steps <- 75
+x0 <- c(-200, 2, 0, 2000, 5, 0)
+n_reps <- 10  # Number of replicates per setting
+
+results_allcompare <- data.frame()
+set.seed(123)
+evaluate_combo <- function(R_scale, sigma_a, n_reps = 20) {
+  rmse_ekf <- numeric(n_reps)
+  rmse_ukf <- numeric(n_reps)
+  rmse_ekf_radar <- numeric(n_reps)
+  rmse_ukf_radar <- numeric(n_reps)
+  
+  q <- sigma_a^2
+  Q_block <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) * q
+  
+  Q_matrix <- matrix(0, nrow = 6, ncol = 6)
+  Q_matrix[1:3, 1:3] <- Q_block
+  Q_matrix[4:6, 4:6] <- Q_block
+  
+  R_tri <- diag(c(50, 50)) * R_scale
+  R_radar <- diag(c(50, 0.00005)) * R_scale
+  
+  Q_KF <- diag(c(0, 0, 1, 0, 0, 1)) * 10
+
+  
+  for (i in 1:n_reps) {
+    # Simulate until py stays positive
+    repeat {
+      sim_data <- simulate_flight(x0, n_steps, Q_matrix)
+      if (all(sim_data$py > 0)) break
+    }
+    
+    px <- sim_data$px
+    py <- sim_data$py
+    
+    d1 <- sqrt((px + 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[1, 1]))
+    d2 <- sqrt((px - 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[2, 2]))
+    d <- sqrt(px^2 + py^2) + rnorm(n_steps, sd = sqrt(R_radar[1, 1]))
+    theta <- atan2(py, px) + rnorm(n_steps, sd = sqrt(R_radar[2, 2]))
+    
+    sim_data_noisy <- sim_data
+    sim_data_noisy$d1 <- d1
+    sim_data_noisy$d2 <- d2
+    sim_data_noisy$d <- d
+    sim_data_noisy$theta <- theta
+    
+    # Run filters
+    ekf_result       <- run_EKF(sim_data_noisy, alpha = 0.003, Q = Q_KF, R = R_tri,   x0 = x0)
+    ukf_result       <- run_UKF(sim_data_noisy, alpha = 0.003, beta = 2, kappa = 0, Q = Q_KF, R = R_tri,   x0 = x0)
+    ekf_radar_result <- run_EKF_radar(sim_data_noisy, alpha = 0.003, Q = Q_KF, R = R_radar, x0 = x0)
+    ukf_radar_result <- run_UKF_radar(sim_data_noisy, alpha = 0.003, beta = 2, kappa = 0, Q = Q_KF, R = R_radar, x0 = x0)
+    
+    # RMSE
+    true_x <- sim_data$px
+    true_y <- sim_data$py
+    
+    rmse_ekf[i]        <- sqrt(mean((ekf_result$x - true_x)^2 + (ekf_result$y - true_y)^2))
+    rmse_ukf[i]        <- sqrt(mean((ukf_result$x - true_x)^2 + (ukf_result$y - true_y)^2))
+    rmse_ekf_radar[i]  <- sqrt(mean((ekf_radar_result$x - true_x)^2 + (ekf_radar_result$y - true_y)^2))
+    rmse_ukf_radar[i]  <- sqrt(mean((ukf_radar_result$x - true_x)^2 + (ukf_radar_result$y - true_y)^2))
+  }
+  
+  return(c(
+    mean(rmse_ekf), 
+    mean(rmse_ukf), 
+    mean(rmse_ekf_radar), 
+    mean(rmse_ukf_radar)
+  ))
+}
+
+# Run grid
+for (i in seq_len(nrow(param_grid))) {
+  row <- param_grid[i, ]
+  cat("Evaluating", i, "/", nrow(param_grid), ":", 
+      "R_scale =", row$R_scale, "sigma_a =", row$sigma_a, "\n")
+  
+  rmse_vals <- evaluate_combo(row$R_scale, row$sigma_a, n_reps)
+  
+  results_allcompare <- rbind(results_allcompare, data.frame(
+  R_scale = row$R_scale,
+  sigma_a = row$sigma_a,
+  RMSE_EKF = rmse_vals[1],
+  RMSE_UKF = rmse_vals[2],
+  RMSE_EKF_RADAR = rmse_vals[3],
+  RMSE_UKF_RADAR = rmse_vals[4]
+))
+
+}
+
+saveRDS(results_allcompare, "filter_grid_results.rds")
+print(results_allcompare)
+
+```
+
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Choose a fixed value for sigma_a and R_scale
+fixed_sigma_a <- 0.220
+fixed_R_scale <- 0.8857143  
+
+# 1. RMSE vs R_scale
+plot1_data <- results_allcompare %>%
+  filter(abs(sigma_a - fixed_sigma_a) < 1e-6) %>%
+  select(R_scale, RMSE_EKF, RMSE_UKF, RMSE_EKF_RADAR, RMSE_UKF_RADAR) %>%
+  pivot_longer(-R_scale, names_to = "Filter", values_to = "RMSE")
+
+plot1 <- ggplot(plot1_data, aes(x = R_scale, y = RMSE, color = Filter)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(title = paste("RMSE vs R_scale (sigma_a =", fixed_sigma_a, ")"),
+       x = "R_scale", y= "RMSE") +
+  theme_minimal()
+
+# 2. RMSE vs sigma_a
+plot2_data <- results_allcompare %>%
+  filter(abs(R_scale - fixed_R_scale) < 1e-6) %>%
+  select(sigma_a, RMSE_EKF, RMSE_UKF, RMSE_EKF_RADAR, RMSE_UKF_RADAR) %>%
+  pivot_longer(-sigma_a, names_to = "Filter", values_to = "RMSE")
+
+plot2 <- ggplot(plot2_data, aes(x = sigma_a, y = RMSE, color = Filter)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(title = paste("RMSE vs sigma_a (R_scale =", fixed_R_scale, ")"),
+       x = "sigma_a", y = "RMSE") +
+  theme_minimal()
+
+# Display plots
+print(plot1)
+print(plot2)
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 1. Heatmap for UKF vs EKF (triangulation)
+heatmap1_data <- results_allcompare %>%
+  mutate(RMSE_diff = RMSE_UKF - RMSE_EKF)
+
+heatmap1 <- ggplot(heatmap1_data, aes(x = R_scale, y = sigma_a, fill = RMSE_diff)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "UKF vs EKF RMSE Difference (Triangulation)",
+       x = "R_scale", y = "sigma_a", fill = "RMSE Diff") +
+  theme_minimal()
+
+# 2. Heatmap for UKF_RADAR vs EKF_RADAR
+heatmap2_data <- results_allcompare %>%
+  mutate(RMSE_diff_radar = RMSE_UKF_RADAR - RMSE_EKF_RADAR)
+
+heatmap2 <- ggplot(heatmap2_data, aes(x = R_scale, y = sigma_a, fill = RMSE_diff_radar)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "UKF vs EKF RMSE Difference (Radar)",
+       x = "R_scale", y = "sigma_a", fill = "RMSE Diff") +
+  theme_minimal()
+
+print(heatmap1)
+print(heatmap2)
+
+
+```
+
+
+```{r}
+heatmap1_annotated <- ggplot(heatmap1_data, aes(x = R_scale, y = sigma_a, fill = RMSE_diff)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(
+    "E:", sprintf("%.2f", RMSE_EKF), "\n",
+    "U:", sprintf("%.2f", RMSE_UKF)
+  )),
+  size = 3, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(
+    title = "UKF vs EKF RMSE Difference (Triangulation)",
+    x = "R_scale", y = "sigma_a", fill = "UKF - EKF"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+```{r}
+
+R_scales <- seq(0.5, 0.5, length.out = 1)
+sigma_as <- seq(0.01, 0.5, length.out = 15)
+alphas <- seq(0.01, 1, length.out = 15)
+betas <- seq(2, 2, length.out = 1)
+kappas <- seq(0, 0, length.out = 1)
+
+
+
+param_grid <- expand.grid(R_scale = R_scales, sigma_a = sigma_as, alpha=alphas, beta=betas,kappa=kappas)
+
+dt <- 1
+n_steps <- 10
+x0 <- c(-200, 2, 0, 2000, 5, 0)
+n_reps <- 100  # Number of replicates per setting
+
+results_allcompare <- data.frame()
+
+
+evaluate_combo <- function(R_scale, sigma_a, n_reps = 10) {
+  rmse_ekf <- numeric(n_reps)
+  rmse_ukf <- numeric(n_reps)
+  rmse_ekf_radar <- numeric(n_reps)
+  rmse_ukf_radar <- numeric(n_reps)
+  
+  q <- sigma_a^2
+  Q_block <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) * q
+  
+  Q_matrix <- matrix(0, nrow = 6, ncol = 6)
+  Q_matrix[1:3, 1:3] <- Q_block
+  Q_matrix[4:6, 4:6] <- Q_block
+  
+  R_tri <- diag(c(50, 50)) * R_scale
+  R_radar <- diag(c(50, 0.00005)) * R_scale
+  
+  Q_KF <- diag(c(1,1,1,1,1,1))* q * 10
+  
+  for (i in 1:n_reps) {
+    
+    repeat {
+      sim_data <- simulate_flight(x0, n_steps, Q_matrix)
+      if (all(sim_data$py > 0)) break
+    }
+    
+    px <- sim_data$px
+    py <- sim_data$py
+    
+    d1 <- sqrt((px + 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[1, 1]))
+    d2 <- sqrt((px - 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[2, 2]))
+    d <- sqrt(px^2 + py^2) + rnorm(n_steps, sd = sqrt(R_radar[1, 1]))
+    theta <- atan2(py, px) + rnorm(n_steps, sd = sqrt(R_radar[2, 2]))
+    
+    sim_data_noisy <- sim_data
+    sim_data_noisy$d1 <- d1
+    sim_data_noisy$d2 <- d2
+    sim_data_noisy$d <- d
+    sim_data_noisy$theta <- theta
+    
+    Q_KF <- Q_matrix *20
+    #run filters
+    ekf_result       <- run_EKF(sim_data_noisy, alpha = alpha, Q = Q_KF, R = R_tri,   x0 = x0)
+    ukf_result       <- run_UKF(sim_data_noisy, alpha = alpha, beta = 0, kappa = kappa, Q = Q_KF, R = R_tri,   x0 = x0)
+    ekf_radar_result <- run_EKF_radar(sim_data_noisy, alpha = alpha, Q = Q_KF, R = R_radar, x0 = x0)
+    ukf_radar_result <- run_UKF_radar(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa, Q = Q_KF, R = R_radar, x0 = x0)
+    
+    #RMSE
+    true_x <- sim_data$px
+    true_y <- sim_data$py
+    
+    rmse_ekf[i]        <- sqrt(mean((ekf_result$x - true_x)^2 + (ekf_result$y - true_y)^2))
+    rmse_ukf[i]        <- sqrt(mean((ukf_result$x - true_x)^2 + (ukf_result$y - true_y)^2))
+    rmse_ekf_radar[i]  <- sqrt(mean((ekf_radar_result$x - true_x)^2 + (ekf_radar_result$y - true_y)^2))
+    rmse_ukf_radar[i]  <- sqrt(mean((ukf_radar_result$x - true_x)^2 + (ukf_radar_result$y - true_y)^2))
+  }
+  
+  return(c(
+    mean(rmse_ekf), 
+    mean(rmse_ukf), 
+    mean(rmse_ekf_radar), 
+    mean(rmse_ukf_radar)
+  ))
+}
+
+for (i in seq_len(nrow(param_grid))) {
+  row <- param_grid[i, ]
+  cat("Evaluating", i, "/", nrow(param_grid), ":", 
+      "R_scale =", row$R_scale, "sigma_a =", row$sigma_a, "\n")
+  
+  rmse_vals <- evaluate_combo(row$R_scale, row$sigma_a, n_reps)
+  
+  results_allcompare <- rbind(results_allcompare, data.frame(
+  R_scale = row$R_scale,
+  sigma_a = row$sigma_a,
+  RMSE_EKF = rmse_vals[1],
+  RMSE_UKF = rmse_vals[2],
+  RMSE_EKF_RADAR = rmse_vals[3],
+  RMSE_UKF_RADAR = rmse_vals[4]
+))
+
+}
+
+saveRDS(results_allcompare, "filter_grid_results_all5.rds")
+print(results_allcompare)
+```
+
+# Replication Study
+
+## 4d functions
+
+```{r}
+
+
+setwd("C:/Users/SamZalewski/Documents/TFM")
+
+run_EKF4 <- function(sim_data, trilateration = FALSE, alpha = 0, Q, R, x0) {
+  dt <- 1
+  library(numDeriv)
+
+  f <- function(x) {
+    c(
+      x[1] + dt * x[3],  # px
+      x[2] + dt * x[4],  # py
+      x[3],              # vx
+      x[4]               # vy
+    )
+  }
+
+  h <- function(x) {
+    px <- x[1]
+    py <- x[2]
+    c(
+      sqrt((px + 300)^2 + py^2),
+      sqrt((px - 300)^2 + py^2)
+    )
+  }
+
+  y <- t(as.matrix(cbind(sim_data$d1, sim_data$d2)))
+  P0 <- diag(rep(1, 4))
+
+  result <- extendedkalmanf_all(y, f, Q = Q, h = h, R = R, x0 = x0, P0 = P0, alpha = alpha)
+  list(x = result$x.f[1, ], y = result$x.f[2, ])
+}
+
+run_UKF4 <- function(sim_data, alpha = 1, beta = 0, kappa = 2, Q, R, x0) {
+  dt <- 1
+  library(numDeriv)
+
+  f <- function(x) {
+    c(
+      x[1] + dt * x[3],
+      x[2] + dt * x[4],
+      x[3],
+      x[4]
+    )
+  }
+
+  h <- function(x) {
+    px <- x[1]
+    py <- x[2]
+    c(
+      sqrt((px + 300)^2 + py^2),
+      sqrt((px - 300)^2 + py^2)
+    )
+  }
+
+  y <- t(as.matrix(cbind(sim_data$d1, sim_data$d2)))
+  P0 <- diag(rep(1, 4))
+
+  result <- unscentedkalmanf_all_newweights(y, f, Q = Q, h = h, R = R, x0 = x0, P0 = P0,
+                                            alpha = alpha, beta = beta, kappa = kappa)
+  list(x = result$x.f[1, ], y = result$x.f[2, ])
+}
+
+run_EKF4_radar <- function(sim_data, alpha = 0.003, Q, R, x0) {
+  dt <- 1
+  library(numDeriv)
+
+  f <- function(x) {
+    c(
+      x[1] + dt * x[3],
+      x[2] + dt * x[4],
+      x[3],
+      x[4]
+    )
+  }
+
+  h <- function(x) {
+    px <- x[1]
+    py <- x[2]
+    c(
+      sqrt(px^2 + py^2),
+      atan2(py, px)
+    )
+  }
+
+  y <- t(as.matrix(cbind(sim_data$d, sim_data$theta)))
+  P0 <- diag(rep(1, 4))
+
+  result <- extendedkalmanf_all(y, f, Q = Q, h = h, R = R, x0 = x0, P0 = P0, alpha = alpha)
+  list(x = result$x.f[1, ], y = result$x.f[2, ])
+}
+
+
+run_UKF4_radar <- function(sim_data, alpha = 0.003, beta = 2, kappa = -3, Q, R, x0) {
+  dt <- 1
+  library(numDeriv)
+
+  f <- function(x) {
+    c(
+      x[1] + dt * x[3],
+      x[2] + dt * x[4],
+      x[3],
+      x[4]
+    )
+  }
+
+  h <- function(x) {
+    px <- x[1]
+    py <- x[2]
+    c(
+      sqrt(px^2 + py^2),
+      atan2(py, px)
+    )
+  }
+
+  y <- t(as.matrix(cbind(sim_data$d, sim_data$theta)))
+  P0 <- diag(rep(1, 4))
+
+  result <- unscentedkalmanf_all_newweights(y, f, Q = Q, h = h, R = R, x0 = x0, P0 = P0,
+                                            alpha = alpha, beta = beta, kappa = kappa)
+  list(x = result$x.f[1, ], y = result$x.f[2, ])
+}
+
+
+
+
+simulate_flight4 <- function(x0, n_steps, accel_var = 0.5) {
+  dt <- 1
+
+
+  F <- matrix(c(
+    1, 0, dt,  0,
+    0, 1,  0, dt,
+    0, 0,  1,  0,
+    0, 0,  0,  1
+  ), nrow = 4, byrow = TRUE)
+
+  state <- matrix(NA, nrow = n_steps, ncol = 4)
+  state[1, ] <- x0
+
+
+  
+  for (k in 2:n_steps) {
+    prev_state <- F %*% state[k - 1, ]
+    
+    ax_noise <- rnorm(1, mean = 0, sd = sqrt(accel_var))
+    ay_noise <- rnorm(1, mean = 0, sd = sqrt(accel_var))
+
+    new_state <- prev_state
+    new_state[3] <- new_state[3] + ax_noise 
+    new_state[4] <- new_state[4] + ay_noise  
+
+    state[k, ] <- new_state
+  }
+
+  return(data.frame(
+    time = 1:n_steps,
+    px = state[, 1],
+    py = state[, 2],
+    vx = state[, 3],
+    vy = state[, 4]
+  ))
+}
+
+
+```
+
+
+## indivudal graph 4d tri
+
+```{r}
+setwd("C:/Users/SamZalewski/Documents/TFM")
+
+
+library(ggplot2)
+
+
+# Simulation parameters
+dt <- 1
+n_steps <- 80
+x0 <- c(-200, 200, 2, 0)
+sigma_a <- 0.02
+Q_KF <- diag(c(1, 1, 1, 1)) *5
+R_tri <- diag(c(200, 200))
+
+# Simulate data
+sim_data <- simulate_flight4(x0, n_steps, accel_var = 0.5)
+px <- sim_data$px
+py <- sim_data$py
+
+# Add triangulation noise
+d1 <- sqrt((px + 300)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[1, 1]))
+d2 <- sqrt((px - 300)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[2, 2]))
+
+sim_data$d1 <- d1
+sim_data$d2 <- d2
+
+# Run filter (e.g., UKF)
+result <- run_UKF4(sim_data, Q = Q_KF, R = R_tri, x0 = x0)
+
+# Triangulate measurements
+triangulate_position <- function(d1, d2) {
+  baseline <- 300
+  px <- (d1^2 - d2^2) / (4 * baseline)
+  inside_sqrt <- d1^2 - (px + baseline)^2
+  py <- ifelse(inside_sqrt >= 0, sqrt(inside_sqrt), NA)
+  return(c(px, py))
+}
+
+
+
+positions <- mapply(triangulate_position, sim_data$d1, sim_data$d2)
+measured_x <- positions[1, ]
+measured_y <- positions[2, ]
+
+
+plot_df <- data.frame(
+  True_X = px,
+  True_Y = py,
+  Filtered_X = result$x,
+  Filtered_Y = result$y,
+  Measured_X = measured_x,
+  Measured_Y = measured_y,
+  Time = 1:n_steps
+)
+
+
+ggplot() +
+  geom_path(data = plot_df, aes(x = True_X, y = True_Y, color = "True Trajectory"), linetype = "dotted", size = 1) +
+  geom_path(data = plot_df, aes(x = Filtered_X, y = Filtered_Y, color = "Filtered Trajectory"), size = 1) +
+  geom_point(data = plot_df, aes(x = Measured_X, y = Measured_Y, color = "Measurements"), shape = 4, size = 2) +
+  labs(x = "X Position", y = "Y Position", color = "Legend") +
+  scale_color_manual(values = c(
+    "True Trajectory" = "black",
+    "Filtered Trajectory" = "blue",
+    "Measurements" = "red"
+  )) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+mse_triangle <- mean((result$x - px)^2 + (result$y - py)^2, na.rm = TRUE)
+cat("Mean Squared Error (MSE):", round(mse_triangle, 2), "\n")
+
+
+```
+## individual graph 4d rad
+
+```{r}
+
+setwd("C:/Users/SamZalewski/Documents/TFM")
+
+library(ggplot2)
+
+# Simulation parameters
+dt <- 1
+n_steps <- 80
+x0 <- c(-200, 200, 2, 0)
+sigma_a <- 0.02
+Q_KF <- diag(c(1, 1, 1, 1)) * 1
+R_radar <- diag(c(200, 0.003))  # radar noise: range and angle
+
+# Simulate data
+sim_data <- simulate_flight4(x0, n_steps, accel_var = 0.5)
+px <- sim_data$px
+py <- sim_data$py
+
+# Generate radar-style measurements
+d <- sqrt(px^2 + py^2) + rnorm(n_steps, sd = sqrt(R_radar[1, 1]))
+theta <- atan2(py, px) + rnorm(n_steps, sd = sqrt(R_radar[2, 2]))
+sim_data$d <- d
+sim_data$theta <- theta
+
+# Run radar-style UKF
+result <- run_UKF4_radar(sim_data, Q = Q_KF, R = R_radar, x0 = x0)
+
+# Convert polar measurements to Cartesian (for plotting)
+measured_x <- d * cos(theta)
+measured_y <- d * sin(theta)
+
+# Combine into a dataframe
+plot_df <- data.frame(
+  True_X = px,
+  True_Y = py,
+  Filtered_X = result$x,
+  Filtered_Y = result$y,
+  Measured_X = measured_x,
+  Measured_Y = measured_y,
+  Time = 1:n_steps
+)
+
+# Plot
+ggplot() +
+  geom_path(data = plot_df, aes(x = True_X, y = True_Y, color = "True Trajectory"), linetype = "dotted", size = 1) +
+  geom_path(data = plot_df, aes(x = Filtered_X, y = Filtered_Y, color = "Filtered Trajectory"), size = 1) +
+  geom_point(data = plot_df, aes(x = Measured_X, y = Measured_Y, color = "Measurements"), shape = 4, size = 2) +
+  labs(x = "X Position", y = "Y Position", color = "Legend") +
+  scale_color_manual(values = c(
+    "True Trajectory" = "black",
+    "Filtered Trajectory" = "blue",
+    "Measurements" = "red"
+  )) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+# MSE
+mse_radar <- mean((result$x - px)^2 + (result$y - py)^2, na.rm = TRUE)
+cat("Mean Squared Error (MSE):", round(mse_radar, 2), "\n")
+
+```
+
+
+
+
+
+
+
+## loop
+
+
+
+```{r}
+setwd("C:/Users/SamZalewski/Documents/TFM")
+
+
+set.seed(123)
+
+dt <- 1
+n_steps <- 80
+x0 <- c(-200, 200, 2, 0)  # [px, py, vx, vy]
+n_reps <- 10000
+
+alpha <- 0.0001
+beta <- 2
+kappa <- 0
+
+sigma_a <- 0.02
+Q_KF <- diag(c(1, 1, 1, 1)) * 5
+
+R_tri   <- diag(c(200, 200))
+R_radar <- diag(c(200, 0.003))
+
+# Pre-allocate for the MAX possible size; we will fill up to k*n_steps
+all_sq_ekf_tri   <- numeric(n_reps * n_steps)
+all_sq_ukf_tri   <- numeric(n_reps * n_steps)
+all_sq_ekf_radar <- numeric(n_reps * n_steps)
+all_sq_ukf_radar <- numeric(n_reps * n_steps)
+
+# Optional: still keep per-run MSEs if you want to compare
+mse_ekf <- numeric(n_reps)
+mse_ukf <- numeric(n_reps)
+mse_ekf_radar <- numeric(n_reps)
+mse_ukf_radar <- numeric(n_reps)
+
+k <- 0  # number of COMPLETED runs
+
+for (i in 1:n_reps) {
+  sim_data <- simulate_flight4(x0, n_steps, 0.5)
+  px <- sim_data$px
+  py <- sim_data$py
+
+  # Skip this run if below x-axis
+  if (any(py < 0)) next
+
+  # Generate noisy measurements
+  d1 <- sqrt((px + 300)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[1, 1]))
+  d2 <- sqrt((px - 300)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[2, 2]))
+  d  <- sqrt(px^2 + py^2) + rnorm(n_steps, sd = sqrt(R_radar[1, 1]))
+  theta <- atan2(py, px) + rnorm(n_steps, sd = sqrt(R_radar[2, 2]))
+
+  sim_data_noisy <- sim_data
+  sim_data_noisy$d1 <- d1
+  sim_data_noisy$d2 <- d2
+  sim_data_noisy$d <- d
+  sim_data_noisy$theta <- theta
+
+  # Run filters
+  ekf_result       <- run_EKF4(sim_data_noisy, Q = Q_KF, R = R_tri,   x0 = x0)
+  ukf_result       <- run_UKF4(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa, Q = Q_KF, R = R_tri,   x0 = x0)
+  ekf_radar_result <- run_EKF4_radar(sim_data_noisy, Q = Q_KF, R = R_radar, x0 = x0)
+  ukf_radar_result <- run_UKF4_radar(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa, Q = Q_KF, R = R_radar, x0 = x0)
+
+  # Position squared errors (x & y)
+  sq_errors_ekf       <- (ekf_result$x       - px)^2 + (ekf_result$y       - py)^2
+  sq_errors_ukf       <- (ukf_result$x       - px)^2 + (ukf_result$y       - py)^2
+  sq_errors_ekf_radar <- (ekf_radar_result$x - px)^2 + (ekf_radar_result$y - py)^2
+  sq_errors_ukf_radar <- (ukf_radar_result$x - px)^2 + (ukf_radar_result$y - py)^2
+
+  # Cap individual squared errors at 1000 (as in paper)
+  sq_errors_ekf[sq_errors_ekf > 1000]                   <- 1000
+  sq_errors_ukf[sq_errors_ukf > 1000]                   <- 1000
+  sq_errors_ekf_radar[sq_errors_ekf_radar > 1000]       <- 1000
+  sq_errors_ukf_radar[sq_errors_ukf_radar > 1000]       <- 1000
+
+  # Advance completed-run counter and write contiguously
+  k <- k + 1
+  idx <- ((k - 1) * n_steps + 1):(k * n_steps)
+  all_sq_ekf_tri[idx]   <- sq_errors_ekf
+  all_sq_ukf_tri[idx]   <- sq_errors_ukf
+  all_sq_ekf_radar[idx] <- sq_errors_ekf_radar
+  all_sq_ukf_radar[idx] <- sq_errors_ukf_radar
+
+  # (Optional) per-run MSEs
+  mse_ekf[k]       <- mean(sq_errors_ekf)
+  mse_ukf[k]       <- mean(sq_errors_ukf)
+  mse_ekf_radar[k] <- mean(sq_errors_ekf_radar)
+  mse_ukf_radar[k] <- mean(sq_errors_ukf_radar)
+}
+
+# Keep only filled portion
+N_total <- k * n_steps
+all_sq_ekf_tri   <- all_sq_ekf_tri[1:N_total]
+all_sq_ukf_tri   <- all_sq_ukf_tri[1:N_total]
+all_sq_ekf_radar <- all_sq_ekf_radar[1:N_total]
+all_sq_ukf_radar <- all_sq_ukf_radar[1:N_total]
+
+# Overall MSE across ALL runs × steps (new averaging)
+MSE_ekf_tri   <- mean(all_sq_ekf_tri)
+MSE_ukf_tri   <- mean(all_sq_ukf_tri)
+MSE_ekf_radar <- mean(all_sq_ekf_radar)
+MSE_ukf_radar <- mean(all_sq_ukf_radar)
+
+# Earlier SE/variance definition: var(sq errors) / n_reps
+Var_prev_ekf_tri   <- var(all_sq_ekf_tri)   / n_reps
+Var_prev_ukf_tri   <- var(all_sq_ukf_tri)   / n_reps
+Var_prev_ekf_radar <- var(all_sq_ekf_radar) / n_reps
+Var_prev_ukf_radar <- var(all_sq_ukf_radar) / n_reps
+
+results_summary <- data.frame(
+  Filter = c("EKF Tri", "UKF Tri", "EKF Radar", "UKF Radar"),
+  MSE = c(MSE_ekf_tri, MSE_ukf_tri, MSE_ekf_radar, MSE_ukf_radar),
+  Var_of_MSE_Est = c(Var_prev_ekf_tri, Var_prev_ukf_tri, Var_prev_ekf_radar, Var_prev_ukf_radar),
+  SE_of_MSE_Est  = sqrt(c(Var_prev_ekf_tri, Var_prev_ukf_tri, Var_prev_ekf_radar, Var_prev_ukf_radar))
+)
+
+print(results_summary)
+saveRDS(results_summary, "results_summary_4D_overallMSE_prevSE.rds")
+
+
+```
+
+
+
+
+
+# UKF vs EKF with Varying Process and Measurement Noise
+
+
+```{r}
+
+# Remove future-related libraries
+# library(future)
+# library(future.apply)
+# library(progressr)
+
+set.seed(123)
+
+R_scales <- seq(0.1, 1, length.out = 10)
+sigma_as <- seq(0.01, 0.03, length.out = 10)
+alphas <- seq(0.0001, 0.0001, length.out = 1)
+betas <- seq(2, 2, length.out = 1)
+kappas <- seq(0, 0, length.out = 1)
+
+param_grid <- expand.grid(R_scale = R_scales, sigma_a = sigma_as, alpha = alphas, beta = betas, kappa = kappas)
+
+dt <- 1
+n_steps <- 30
+x0 <- c(-200, 2, 0, 2000, 5, 0)
+n_reps <- 100  # Number of replicates per setting
+
+results_allcompare <- data.frame()
+
+evaluate_combo <- function(R_scale, sigma_a, alpha, beta, kappa, n_reps = 10) {
+  mse_ekf <- numeric(n_reps)
+  mse_ukf <- numeric(n_reps)
+  mse_ekf_radar <- numeric(n_reps)
+  mse_ukf_radar <- numeric(n_reps)
+  
+  q <- sigma_a^2
+  Q_block <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) * q
+  
+  Q_matrix <- matrix(0, nrow = 6, ncol = 6)
+  Q_matrix[1:3, 1:3] <- Q_block
+  Q_matrix[4:6, 4:6] <- Q_block
+  
+  
+  Q_KF <- diag(c(1,1,1,1,1,1))* sigma_a * 10
+  
+  
+  R_tri <- diag(c(50, 50)) * R_scale
+  R_radar <- diag(c(50, 0.00005)) * R_scale
+  
+  for (i in 1:n_reps) {
+    repeat {
+      sim_data <- simulate_flight(x0, n_steps, Q_matrix)
+      if (all(sim_data$py > 0)) break
+    }
+    
+    px <- sim_data$px
+    py <- sim_data$py
+    
+    d1 <- sqrt((px + 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[1, 1]))
+    d2 <- sqrt((px - 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[2, 2]))
+    d <- sqrt(px^2 + py^2) + rnorm(n_steps, sd = sqrt(R_radar[1, 1]))
+    theta <- atan2(py, px) + rnorm(n_steps, sd = sqrt(R_radar[2, 2]))
+    
+    sim_data_noisy <- sim_data
+    sim_data_noisy$d1 <- d1
+    sim_data_noisy$d2 <- d2
+    sim_data_noisy$d <- d
+    sim_data_noisy$theta <- theta
+    
+    ekf_result       <- run_EKF(sim_data_noisy, alpha = alpha, Q = Q_KF, R = R_tri,   x0 = x0)
+    ukf_result       <- run_UKF(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa, Q = Q_KF, R = R_tri,   x0 = x0)
+    ekf_radar_result <- run_EKF_radar(sim_data_noisy, alpha = alpha, Q = Q_KF, R = R_radar, x0 = x0)
+    ukf_radar_result <- run_UKF_radar(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa, Q = Q_KF, R = R_radar, x0 = x0)
+    
+    true_x <- sim_data$px
+    true_y <- sim_data$py
+    
+    mse_ekf[i]        <- mean((ekf_result$x - true_x)^2 + (ekf_result$y - true_y)^2)
+    mse_ukf[i]        <- mean((ukf_result$x - true_x)^2 + (ukf_result$y - true_y)^2)
+    mse_ekf_radar[i]  <- mean((ekf_radar_result$x - true_x)^2 + (ekf_radar_result$y - true_y)^2)
+    mse_ukf_radar[i]  <- mean((ukf_radar_result$x - true_x)^2 + (ukf_radar_result$y - true_y)^2)
+  }
+  
+  return(c(
+    mean(mse_ekf), 
+    mean(mse_ukf), 
+    mean(mse_ekf_radar), 
+    mean(mse_ukf_radar)
+  ))
+}
+
+evaluate_row <- function(row) {
+  mse_vals <- evaluate_combo(
+    R_scale = row$R_scale,
+    sigma_a = row$sigma_a,
+    alpha   = row$alpha,
+    beta    = row$beta,
+    kappa   = row$kappa,
+    n_reps  = n_reps
+  )
+  
+  return(data.frame(
+    R_scale = row$R_scale,
+    sigma_a = row$sigma_a,
+    alpha   = row$alpha,
+    beta    = row$beta,
+    kappa   = row$kappa,
+    MSE_EKF        = mse_vals[1],
+    MSE_UKF        = mse_vals[2],
+    MSE_EKF_RADAR  = mse_vals[3],
+    MSE_UKF_RADAR  = mse_vals[4]
+  ))
+}
+
+# Sequential evaluation
+results_allcompare_list <- lapply(seq_len(nrow(param_grid)), function(i) {
+  cat(sprintf("Evaluating %d/%d\n", i, nrow(param_grid)))
+  evaluate_row(param_grid[i, ])
+})
+
+results_allcompare <- do.call(rbind, results_allcompare_list)
+
+saveRDS(results_allcompare, "filter_grid_results_all5.rds")
+print(results_allcompare)
+
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+
+# Load full grid results
+results_allcompare <- readRDS("filter_grid_results_all5.rds")
+
+# Compute relative gains (UKF improvement over EKF, normalized by EKF MSE)
+mse_summary <- results_allcompare %>%
+  group_by(R_scale, sigma_a) %>%
+  summarise(
+    mean_MSE_EKF         = mean(MSE_EKF, na.rm = TRUE),
+    mean_MSE_UKF         = mean(MSE_UKF, na.rm = TRUE),
+    mean_MSE_EKF_RADAR   = mean(MSE_EKF_RADAR, na.rm = TRUE),
+    mean_MSE_UKF_RADAR   = mean(MSE_UKF_RADAR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    REL_GAIN_TRIANG = 100 * (mean_MSE_EKF - mean_MSE_UKF) / mean_MSE_EKF,
+    REL_GAIN_RADAR  = 100 * (mean_MSE_EKF_RADAR - mean_MSE_UKF_RADAR) / mean_MSE_EKF_RADAR
+  )
+
+# Define color range for relative gain
+rel_range <- c(-50, 50)  # You can adjust if needed
+
+
+
+# Plot 1: Relative gain for trilateration
+p1 <- ggplot(mse_summary, aes(x = R_scale, y = sigma_a, fill = REL_GAIN_TRIANG)) +
+  geom_tile() +
+  geom_text(aes(label = signif(REL_GAIN_TRIANG, 2)), size = 3) +
+  scale_fill_gradientn(
+  colours = c("orangered", "white", "blue"),
+  values = scales::rescale(c(-50, 0, 50)),
+  limits = rel_range,
+  oob = scales::squish,
+  name = "Relative Improvement (%)",
+  breaks = c(-50, 0, 50),
+  labels = c("EKF Better", "Equal", "UKF Better")
+)+
+  labs(title = "Trilateration-Style", x = "Measurement Noise", y = "Process Noise") +
+  theme_minimal() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+
+
+
+p2 <- ggplot(mse_summary, aes(x = R_scale, y = sigma_a, fill = REL_GAIN_RADAR)) +
+  geom_tile() +
+  geom_text(aes(label = signif(REL_GAIN_RADAR, 2)), size = 3) +
+ scale_fill_gradientn(
+  colours = c("orangered", "white", "blue"),
+  values = scales::rescale(c(-50, 0, 50)),
+  limits = rel_range,
+  oob = scales::squish,
+  name = "Relative Improvement (%)",
+  breaks = c(-50, 0, 50),
+  labels = c("EKF Better", "Equal", "UKF Better")
+)+
+    labs(title = "Radar-Style", x = "Measurement Noise", y = "Process Noise") +
+  theme_minimal() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),  axis.title.y = element_blank())
+
+
+
+# Combine plots
+p1 + p2 + plot_layout(guides = "collect") & theme(legend.position = "right")
+
+
+
+```
+
+
+
+# Alpha, Beta, and Kappa across Varying Process and Measurement Noise
+
+
+
+
+```{r}
+
+# Remove future-related libraries
+# library(future)
+# library(future.apply)
+# library(progressr)
+
+set.seed(123)
+
+# Grid definition
+R_scales <- seq(0.1, 1, length.out = 10)
+sigma_as <- seq(0.01, 0.03, length.out = 10)
+alphas <- seq(0.0001, 1, length.out = 5)
+betas  <- c(0,1,2,3,4)
+kappas <- seq(-3, 3, length.out = 5)
+
+param_grid <- expand.grid(R_scale = R_scales, sigma_a = sigma_as,
+                          alpha = alphas, beta = betas, kappa = kappas)
+
+# Constants
+dt <- 1
+n_steps <- 30
+x0 <- c(-200, 2, 0, 2000, 5, 0)
+n_reps <- 500  # Number of replicates per setting
+
+results_ukf_only <- data.frame()
+
+# Evaluation function (UKF only, triangulation only)
+evaluate_combo <- function(R_scale, sigma_a, alpha, beta, kappa, n_reps = 10) {
+  mse_ukf <- numeric(n_reps)
+
+  # Process noise
+  q <- sigma_a^2
+  Q_block <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) * q
+
+  Q_matrix <- matrix(0, nrow = 6, ncol = 6)
+  Q_matrix[1:3, 1:3] <- Q_block
+  Q_matrix[4:6, 4:6] <- Q_block
+
+  Q_KF <- diag(6) * sigma_a * 10
+
+  R_tri <- diag(c(50, 50)) * R_scale
+
+  for (i in 1:n_reps) {
+    repeat {
+      sim_data <- simulate_flight(x0, n_steps, Q_matrix)
+      if (all(sim_data$py > 0)) break
+    }
+
+    px <- sim_data$px
+    py <- sim_data$py
+
+    d1 <- sqrt((px + 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[1, 1]))
+    d2 <- sqrt((px - 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[2, 2]))
+
+    sim_data_noisy <- sim_data
+    sim_data_noisy$d1 <- d1
+    sim_data_noisy$d2 <- d2
+
+    ukf_result <- run_UKF(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa,
+                          Q = Q_KF, R = R_tri, x0 = x0)
+
+    true_x <- sim_data$px
+    true_y <- sim_data$py
+
+    mse_ukf[i] <- mean((ukf_result$x - true_x)^2 + (ukf_result$y - true_y)^2)
+  }
+
+  return(mean(mse_ukf))
+}
+
+# Row-wise wrapper
+evaluate_row <- function(row) {
+  mse_val <- evaluate_combo(
+    R_scale = row$R_scale,
+    sigma_a = row$sigma_a,
+    alpha   = row$alpha,
+    beta    = row$beta,
+    kappa   = row$kappa,
+    n_reps  = n_reps
+  )
+
+  return(data.frame(
+    R_scale = row$R_scale,
+    sigma_a = row$sigma_a,
+    alpha   = row$alpha,
+    beta    = row$beta,
+    kappa   = row$kappa,
+    MSE_UKF = mse_val
+  ))
+}
+
+# Sequential evaluation
+results_ukf_only_list <- lapply(seq_len(nrow(param_grid)), function(i) {
+  cat(sprintf("Evaluating %d/%d\n", i, nrow(param_grid)))
+  evaluate_row(param_grid[i, ])
+})
+
+results_ukf_only <- do.call(rbind, results_ukf_only_list)
+
+# Save result to avoid overwriting prior data
+saveRDS(results_ukf_only, "filter_grid_results_UKF_only.rds")
+print(results_ukf_only)
+
+```
+
+## Alpha
+
+###Measurement
+
+```{r}
+
+
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(cowplot)
+library(patchwork)
+
+# Convert alpha to factor for consistent legend
+results_ukf_only$alpha <- as.factor(results_ukf_only$alpha)
+
+# === Shared color scale ===
+color_values_shared <- brewer.pal(9, "Reds")[5:9]
+
+# === 1. Measurement Noise Plot (averaged across sigma_a, beta, kappa) ===
+avg_measurement <- results_ukf_only %>%
+  group_by(R_scale, alpha) %>%
+  summarize(MSE_UKF = mean(MSE_UKF, na.rm = TRUE), .groups = "drop") %>%
+  group_by(R_scale) %>%
+  mutate(MSE_rescaled = 100 * MSE_UKF / max(MSE_UKF, na.rm = TRUE)) %>%
+  ungroup()
+
+alpha_labels <- c(
+  "1e-04"     = "0.0001",
+  "0.250075"  = "0.25",
+  "0.50005"   = "0.50",
+  "0.750025"  = "0.75",
+  "1"         = "1.0"
+)
+
+# Update both plots with the labels
+p_measurement <- ggplot(avg_measurement, aes(x = R_scale, y = MSE_rescaled, color = alpha, group = alpha)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_values_shared, labels = alpha_labels) +
+  labs(
+    x = "Measurement Noise ",
+    y = "Relative MSE (%)",
+    color = expression(alpha)
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+p_process <- ggplot(avg_process, aes(x = sigma_a, y = MSE_rescaled, color = alpha, group = alpha)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_values_shared, labels = alpha_labels) +
+  labs(
+    x = "Process Noise",
+    y = "Relative MSE (%)",
+    color = expression(alpha)
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+# === Combine ===
+p_measurement / p_process + plot_layout(guides = "collect") & theme(legend.position = "right")
+
+
+```
+
+
+
+
+
+```{r}
+# Load required libraries
+library(dplyr)
+
+# Target values
+target_R <- 0.25
+target_sigma_a <- 0.015
+
+# Find nearest available values
+actual_R <- unique(results_ukf_only$R_scale)[which.min(abs(unique(results_ukf_only$R_scale) - target_R))]
+actual_sigma_a <- unique(results_ukf_only$sigma_a)[which.min(abs(unique(results_ukf_only$sigma_a) - target_sigma_a))]
+
+cat("Closest R_scale:", actual_R, "\n")
+cat("Closest sigma_a:", actual_sigma_a, "\n")
+
+# Filter using actual values
+cell_subset <- results_ukf_only %>%
+  filter(R_scale == actual_R, sigma_a == actual_sigma_a) %>%
+  group_by(alpha) %>%
+  summarize(
+    mean_MSE = mean(MSE_UKF, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_MSE)
+
+# Show sorted MSEs by alpha
+print(cell_subset)
+
+# Optimal alpha in this cell
+optimal_alpha <- cell_subset %>%
+  slice_min(order_by = mean_MSE, n = 1, with_ties = FALSE) %>%
+  pull(alpha)
+
+cat("\nOptimal α in the heatmap for R =", actual_R, 
+    "and σₐ =", actual_sigma_a, "is:", optimal_alpha, "\n")
+
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+
+# Ensure alpha is numeric for comparison
+results_ukf_only$alpha <- as.numeric(as.character(results_ukf_only$alpha))
+
+# For each combination of sigma_a and R_scale, select the alpha with the lowest MSE
+optimal_alpha_grid <- results_ukf_only %>%
+  group_by(sigma_a, R_scale) %>%
+  filter(MSE_UKF == min(MSE_UKF, na.rm = TRUE)) %>%
+  slice(1) %>%  # In case of ties, pick the first
+  ungroup()
+
+# Optional: Convert alpha back to factor if needed for discrete coloring
+optimal_alpha_grid$alpha <- as.factor(optimal_alpha_grid$alpha)
+
+alpha_labels <- c(
+  "1e-04"     = "0.0001",
+  "0.250075"  = "0.25",
+  "0.50005"   = "0.50",
+  "0.750025"  = "0.75",
+  "1"         = "1.0"
+)
+
+# Update both plots with the labels
+p_measurement <- ggplot(avg_measurement, aes(x = R_scale, y = MSE_rescaled, color = alpha, group = alpha)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_values_shared, labels = alpha_labels) +
+  labs(
+    x = "Measurement Noise ",
+    y = "Relative MSE (%)",
+    color = expression(alpha)
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+p_process <- ggplot(avg_process, aes(x = sigma_a, y = MSE_rescaled, color = alpha, group = alpha)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_values_shared, labels = alpha_labels) +
+  labs(
+    x = "Process Noise",
+    y = "Relative MSE (%)",
+    color = expression(alpha)
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+# === Combine ===
+p_measurement / p_process + plot_layout(guides = "collect") & theme(legend.position = "right")
+```
+
+
+```{r}
+library(dplyr)
+
+# unique(results_ukf_only$sigma_a)
+# unique(results_ukf_only$R_scale)
+
+
+target_sigma_a <- 0.03
+target_R_scale <- 0.9
+
+
+unique_sigma <- unique(results_ukf_only$sigma_a)
+unique_R <- unique(results_ukf_only$R_scale)
+
+closest_sigma <- unique_sigma[which.min(abs(unique_sigma - target_sigma_a))]
+closest_R <- unique_R[which.min(abs(unique_R - target_R_scale))]
+1
+
+results_ukf_only %>%
+  filter(sigma_a == closest_sigma, R_scale == closest_R) %>%
+  arrange(MSE_UKF) %>%
+  slice_head(n = 20)
+```
+
+
+
+
+## Beta
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+
+# Ensure beta is numeric for comparison
+results_ukf_only$beta <- as.numeric(as.character(results_ukf_only$beta))
+
+# For each combination of sigma_a and R_scale, select the beta with the lowest MSE
+optimal_beta_grid <- results_ukf_only %>%
+  group_by(sigma_a, R_scale) %>%
+  filter(MSE_UKF == min(MSE_UKF, na.rm = TRUE)) %>%
+  slice(1) %>%  # In case of ties, pick the first
+  ungroup()
+
+# Optional: Convert beta to factor for discrete coloring
+optimal_beta_grid$beta <- as.factor(optimal_beta_grid$beta)
+
+# Plot the heatmap
+ggplot(optimal_beta_grid, aes(x = R_scale, y = sigma_a, fill = beta)) +
+  geom_tile(color = "white") +
+  scale_fill_brewer(palette = "YlGnBu", name = expression(paste("Optimal ", beta))) +
+  labs(
+    x = "Measurement Noise ",
+    y = "Process Noise"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 12),
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.title = element_text(size = 12)
+  )
+
+
+
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(patchwork)
+
+# Convert beta to factor for consistent legend
+results_ukf_only$beta <- as.factor(results_ukf_only$beta)
+
+# === Shared color scale for beta ===
+color_values_blue <- brewer.pal(9, "Blues")[5:9]
+
+# === 1. Measurement Noise Plot (averaged across σₐ, α, κ) ===
+avg_measurement_beta <- results_ukf_only %>%
+  group_by(R_scale, beta) %>%
+  summarize(MSE_UKF = mean(MSE_UKF, na.rm = TRUE), .groups = "drop") %>%
+  group_by(R_scale) %>%
+  mutate(MSE_rescaled = 100 * MSE_UKF / max(MSE_UKF, na.rm = TRUE)) %>%
+  ungroup()
+
+p_measurement_beta <- ggplot(avg_measurement_beta, aes(x = R_scale, y = MSE_rescaled, color = beta, group = beta)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_values_blue) +
+  labs(
+    x = "Measurement Noise",
+    y = "Relative MSE (%)",
+    color = expression(beta)
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+# === 2. Process Noise Plot (averaged across R_scale, α, κ) ===
+avg_process_beta <- results_ukf_only %>%
+  group_by(sigma_a, beta) %>%
+  summarize(MSE_UKF = mean(MSE_UKF, na.rm = TRUE), .groups = "drop") %>%
+  group_by(sigma_a) %>%
+  mutate(MSE_rescaled = 100 * MSE_UKF / max(MSE_UKF, na.rm = TRUE)) %>%
+  ungroup()
+
+p_process_beta <- ggplot(avg_process_beta, aes(x = sigma_a, y = MSE_rescaled, color = beta, group = beta)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_values_blue) +
+  labs(
+    x = "Process Noise",
+    y = "Relative MSE (%)",
+    color = expression(beta)
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+# === 3. Combine Plots ===
+p_measurement_beta / p_process_beta + plot_layout(guides = "collect") & theme(legend.position = "right")
+
+```
+## Kappa
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+
+# Ensure kappa is numeric for comparison
+results_ukf_only$kappa <- as.numeric(as.character(results_ukf_only$kappa))
+
+# For each combination of sigma_a and R_scale, select the kappa with the lowest MSE
+optimal_kappa_grid <- results_ukf_only %>%
+  group_by(sigma_a, R_scale) %>%
+  filter(MSE_UKF == min(MSE_UKF, na.rm = TRUE)) %>%
+  slice(1) %>%  # In case of ties, pick the first
+  ungroup()
+
+# Convert kappa to factor for discrete coloring
+optimal_kappa_grid$kappa <- as.factor(optimal_kappa_grid$kappa)
+
+# Plot the heatmap
+ggplot(optimal_kappa_grid, aes(x = R_scale, y = sigma_a, fill = kappa)) +
+  geom_tile(color = "white") +
+  scale_fill_brewer(palette = "YlGnBu", name = expression(paste("Optimal ", kappa))) +
+  labs(
+    x = "Measurement Noise",
+    y = "Process Noise ",
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 12),
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.title = element_text(size = 12)
+  )
+
+
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(patchwork)
+
+# Convert kappa to factor for consistent legend
+results_ukf_only$kappa <- as.factor(results_ukf_only$kappa)
+
+# === Shared color scale for kappa ===
+color_values_green <- brewer.pal(9, "Greens")[5:9]
+
+# === 1. Measurement Noise Plot (averaged across sigma_a) ===
+avg_measurement_kappa <- results_ukf_only %>%
+  group_by(R_scale, kappa) %>%
+  summarize(MSE_UKF = mean(MSE_UKF, na.rm = TRUE), .groups = "drop") %>%
+  group_by(R_scale) %>%
+  mutate(MSE_rescaled = 100 * MSE_UKF / max(MSE_UKF, na.rm = TRUE)) %>%
+  ungroup()
+
+p_measurement_kappa <- ggplot(avg_measurement_kappa, aes(x = R_scale, y = MSE_rescaled, color = kappa, group = kappa)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_values_green) +
+  labs(
+    x = "Measurement Noise",
+    y = "Relative MSE (%)",
+    color = expression(kappa)
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+# === 2. Process Noise Plot (averaged across R_scale) ===
+avg_process_kappa <- results_ukf_only %>%
+  group_by(sigma_a, kappa) %>%
+  summarize(MSE_UKF = mean(MSE_UKF, na.rm = TRUE), .groups = "drop") %>%
+  group_by(sigma_a) %>%
+  mutate(MSE_rescaled = 100 * MSE_UKF / max(MSE_UKF, na.rm = TRUE)) %>%
+  ungroup()
+
+p_process_kappa <- ggplot(avg_process_kappa, aes(x = sigma_a, y = MSE_rescaled, color = kappa, group = kappa)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_values_green) +
+  labs(
+    x = "Process Noise",
+    y = "Relative MSE (%)",
+    color = expression(kappa)
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+# === 3. Combine Plots ===
+p_measurement_kappa / p_process_kappa + plot_layout(guides = "collect") & theme(legend.position = "right")
+
+
+```
+
+
+
+```{r}
+
+library(RColorBrewer)
+
+color_values <- brewer.pal(9, "YlGnBu")[5:9]
+
+# Plot
+ggplot(rescaled_results, aes(x = R_scale, y = MSE_rescaled, color = alpha, group = alpha)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = color_values) +
+  labs(
+    x = "Measurement Noise",
+    y = "Relative MSE (%)",
+    color = expression(alpha)
+  ) +
+  theme_minimal_hgrid() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+
+
+```
+
+
+
+```{r}
+
+# Remove future-related libraries
+# library(future)
+# library(future.apply)
+# library(progressr)
+
+set.seed(123)
+
+R_scales <- seq(0.1, 1, length.out = 10)
+sigma_as <- seq(0.01, 0.03, length.out = 10)
+alphas <- seq(0.0001, 0.0001, length.out = 1)
+betas <- seq(2, 2, length.out = 1)
+kappas <- seq(0, 0, length.out = 1)
+
+param_grid <- expand.grid(R_scale = R_scales, sigma_a = sigma_as, alpha = alphas, beta = betas, kappa = kappas)
+
+dt <- 1
+n_steps <- 30
+x0 <- c(-200, 2, 0, 2000, 5, 0)
+n_reps <- 100  # Number of replicates per setting
+
+results_allcompare <- data.frame()
+
+evaluate_combo <- function(R_scale, sigma_a, alpha, beta, kappa, n_reps = 10) {
+  mse_ekf <- numeric(n_reps)
+  mse_ukf <- numeric(n_reps)
+  mse_ekf_radar <- numeric(n_reps)
+  mse_ukf_radar <- numeric(n_reps)
+  
+  q <- sigma_a^2
+  Q_block <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) * q
+  
+  Q_matrix <- matrix(0, nrow = 6, ncol = 6)
+  Q_matrix[1:3, 1:3] <- Q_block
+  Q_matrix[4:6, 4:6] <- Q_block
+  
+  
+  Q_KF <- diag(c(1,1,1,1,1,1))* sigma_a * 10
+  
+  
+  R_tri <- diag(c(50, 50)) * R_scale
+  R_radar <- diag(c(50, 0.00005)) * R_scale
+  
+  for (i in 1:n_reps) {
+    repeat {
+      sim_data <- simulate_flight(x0, n_steps, Q_matrix)
+      if (all(sim_data$py > 0)) break
+    }
+    
+    px <- sim_data$px
+    py <- sim_data$py
+    
+    d1 <- sqrt((px + 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[1, 1]))
+    d2 <- sqrt((px - 600)^2 + py^2) + rnorm(n_steps, sd = sqrt(R_tri[2, 2]))
+    d <- sqrt(px^2 + py^2) + rnorm(n_steps, sd = sqrt(R_radar[1, 1]))
+    theta <- atan2(py, px) + rnorm(n_steps, sd = sqrt(R_radar[2, 2]))
+    
+    sim_data_noisy <- sim_data
+    sim_data_noisy$d1 <- d1
+    sim_data_noisy$d2 <- d2
+    sim_data_noisy$d <- d
+    sim_data_noisy$theta <- theta
+    
+    ekf_result       <- run_EKF(sim_data_noisy, alpha = alpha, Q = Q_KF, R = R_tri,   x0 = x0)
+    ukf_result       <- run_UKF(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa, Q = Q_KF, R = R_tri,   x0 = x0)
+    ekf_radar_result <- run_EKF_radar(sim_data_noisy, alpha = alpha, Q = Q_KF, R = R_radar, x0 = x0)
+    ukf_radar_result <- run_UKF_radar(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa, Q = Q_KF, R = R_radar, x0 = x0)
+    
+    true_x <- sim_data$px
+    true_y <- sim_data$py
+    
+    mse_ekf[i]        <- mean((ekf_result$x - true_x)^2 + (ekf_result$y - true_y)^2)
+    mse_ukf[i]        <- mean((ukf_result$x - true_x)^2 + (ukf_result$y - true_y)^2)
+    mse_ekf_radar[i]  <- mean((ekf_radar_result$x - true_x)^2 + (ekf_radar_result$y - true_y)^2)
+    mse_ukf_radar[i]  <- mean((ukf_radar_result$x - true_x)^2 + (ukf_radar_result$y - true_y)^2)
+  }
+  
+  return(c(
+    mean(mse_ekf), 
+    mean(mse_ukf), 
+    mean(mse_ekf_radar), 
+    mean(mse_ukf_radar)
+  ))
+}
+
+evaluate_row <- function(row) {
+  mse_vals <- evaluate_combo(
+    R_scale = row$R_scale,
+    sigma_a = row$sigma_a,
+    alpha   = row$alpha,
+    beta    = row$beta,
+    kappa   = row$kappa,
+    n_reps  = n_reps
+  )
+  
+  return(data.frame(
+    R_scale = row$R_scale,
+    sigma_a = row$sigma_a,
+    alpha   = row$alpha,
+    beta    = row$beta,
+    kappa   = row$kappa,
+    MSE_EKF        = mse_vals[1],
+    MSE_UKF        = mse_vals[2],
+    MSE_EKF_RADAR  = mse_vals[3],
+    MSE_UKF_RADAR  = mse_vals[4]
+  ))
+}
+
+# Sequential evaluation
+results_allcompare_list <- lapply(seq_len(nrow(param_grid)), function(i) {
+  cat(sprintf("Evaluating %d/%d\n", i, nrow(param_grid)))
+  evaluate_row(param_grid[i, ])
+})
+
+results_allcompare <- do.call(rbind, results_allcompare_list)
+
+saveRDS(results_allcompare, "filter_grid_results_all5.rds")
+print(results_allcompare)
+
+```
+
+
+
+
+
+# Kurtosis
+## three distributions
+```{r}
+library(ggplot2)
+library(sn)
+library(cowplot)
+library(moments)
+library(dplyr)
+
+set.seed(123)
+n <- 1000000
+mu_target <- 0
+sigma_target <- 1
+
+norm_vals <- rnorm(n, mean = mu_target, sd = sqrt(sigma_target))
+
+a <- -sqrt(3)
+b <- sqrt(3)
+unif_vals <- runif(n, min = a, max = b)
+
+alpha <- 20
+
+delta <- alpha / sqrt(1 + alpha^2)
+omega <- sqrt(sigma_target) / sqrt(1 - (2 * delta^2 / pi))
+xi <- mu_target - omega * delta * sqrt(2 / pi)
+
+skew_vals <- rsn(n, xi = xi, omega = omega, alpha = alpha)
+
+df <- data.frame(
+  value = c(norm_vals, unif_vals, skew_vals),
+  dist = factor(rep(c("Normal", "Uniform", "Skew-Normal (α = 20)"), each = n))
+)
+
+kurt_vals <- df %>%
+  group_by(dist) %>%
+  summarise(kurt = round(kurtosis(value), 2)) %>%
+  mutate(label = paste0(dist, ": Kurtosis ", kurt))
+
+df <- df %>%
+  left_join(kurt_vals, by = "dist")
+
+
+```
+
+```{r}
+ggplot(df, aes(x = value)) +
+  geom_density(color = "black", size = 0.5) +
+  facet_wrap(~label, ncol = 1, scales = "free_y") +
+  labs(
+    x = "Value", y = "Density"
+  ) +
+  xlim(-5, 5)+
+  theme_minimal(base_size = 14)
+
+```
+
+## normal - uniform blend
+
+```{r}
+library(sn)
+library(ggplot2)
+library(dplyr)
+
+gen_noise <- function(sd, n, skewness, normality_weight) {
+  alpha <- skewness
+  delta <- alpha / sqrt(1 + alpha^2)
+  omega <- sd / sqrt(1 - (2 * delta^2 / pi))
+  xi <- -omega * delta * sqrt(2 / pi)
+  skew_part <- rsn(n, xi = xi, omega = omega, alpha = alpha)
+
+  if (normality_weight < 1) {
+    range <- sqrt(12 * sd^2 * (1 - normality_weight^2) / (1 - normality_weight)^2)
+    unif_part <- runif(n, min = -range / 2, max = range / 2)
+  } else {
+    unif_part <- rep(0, n)
+  }
+  normality_weight * skew_part + (1 - normality_weight) * unif_part
+}
+set.seed(42)
+sd <- 1
+n <- 10000000
+skewness <- 0
+weights <- c(0.0, 0.25, 0.5, 1)
+library(moments) 
+
+density_data <- lapply(weights, function(w) {
+  x <- gen_noise(sd = sd, n = n, skewness = skewness, normality_weight = w)
+  data.frame(x = x, normality_weight = paste0("ρ = ", w))
+}) %>% bind_rows()
+
+ggplot(density_data, aes(x = x, color = normality_weight)) +
+  geom_density(size = 1.2) +
+  labs(
+    title = "The Uniform-Normal Distribution",
+    x = "Value",
+    y = "Density",
+    color = "ρ"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+```{r}
+
+library(nortest)  # For ad.test and lillie.test
+library(tseries)  # For jarque.bera.test
+
+normality_tests <- lapply(weights, function(w) {
+  x <- gen_noise(sd = sd, n = n, skewness = skewness, normality_weight = w)
+  
+  ad_p <- ad.test(x)$p.value
+  lillie_p <- lillie.test(x)$p.value
+  jb_p <- jarque.bera.test(x)$p.value
+  
+  data.frame(
+    normality_weight = w,
+    AD_p_value = ad_p,
+    Lilliefors_p_value = lillie_p,
+    Jarque_Bera_p_value = jb_p
+  )
+})
+
+normality_results <- do.call(rbind, normality_tests)
+print(normality_results)
+
+
+```
+
+
+```{r}
+library(moments)  # for kurtosis()
+
+stats_results <- sapply(weights, function(w) {
+  x <- gen_noise(sd = sd, n = n, skewness = skewness, normality_weight = w)
+  c(
+    Mean = mean(x),
+    Variance = var(x),
+    Kurtosis = kurtosis(x)
+  )
+})
+
+stats_df <- data.frame(
+  Weight = weights,
+  t(stats_results)
+)
+
+print(stats_df)
+
+```
+
+```{r}
+
+alpha_vals <- seq(0.0001, 0.5, length.out = 5)
+beta_vals  <- seq(0, 2, length.out = 5)
+kappa_vals <- seq(0, 5, length.out = 5)
+
+param_grid <- expand.grid(alpha = alpha_vals, beta = beta_vals, kappa = kappa_vals)
+
+dt <- 1  #time step always set to 1
+n_simulations <- 10
+n_steps <- 100
+x0 <- c(-200, 2, 0,  #px, vx, ax
+        2000, 5, 0)  # py, vy, ay
+
+R_scale <- 0.2  #measurement noise
+Q_scale <- 1 #process noise
+Sig <- 0.5
+Q_prop <- 0.5
+
+sigma_a <- 0.05  #acceleration noise std dev
+
+
+q <- sigma_a^2
+
+Q_block <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+Q <- matrix(0, nrow = 6, ncol = 6)
+Q[1:3, 1:3] <- Q_block  # x position, velocity, acceleration
+Q[4:6, 4:6] <- Q_block  # y position, velocity, acceleration
+
+
+evaluate_param_combo <- function(alpha, beta, kappa, n_reps = 10) {
+  rmse_vals <- numeric(n_reps)
+  for (i in seq_len(n_reps)) {
+    
+    sim_data <- simulate_flight(x0, n_steps, Q)
+    px <- sim_data$px
+    py <- sim_data$py
+
+    R_tri <- diag(c(50, 50)) * R_scale
+    R_radar <- diag(c(50, 0.00005)) * R_scale
+  
+    d1 <- sqrt((px + 600)^2 + py^2) + rnorm(length(px), mean = 0, sd = sqrt(R_tri[1,1]))
+    d2 <- sqrt((px - 600)^2 + py^2) + rnorm(length(px), mean = 0, sd = sqrt(R_tri[2,2]))
+  
+  
+  #create noies for radar
+  d <- sqrt(px^2 + py^2) + rnorm(length(px), mean = 0, sd = sqrt(R_radar[1,1]))
+  theta <- atan2(py, px) + rnorm(length(px), mean = 0, sd = sqrt(R_radar[2,2]))
+
+  sim_data_noisy <- sim_data
+  sim_data_noisy$d1 <- d1
+  sim_data_noisy$d2 <- d2
+  sim_data_noisy$d <- d
+  sim_data_noisy$theta <- theta
+    
+    #run_UKF(sim_data_noisy, alpha = 0.003, beta = 2, kappa= -3, Q=Q)
+    result <- run_UKF(sim_data_noisy, alpha = alpha, beta = beta, kappa = kappa,  R=  R_tri, Q=Q,x0=x0)
+    rmse_vals[i] <- sqrt(mean((result$x - sim_data$px)^2 + (result$y - sim_data$py)^2))
+  }
+  return(mean(rmse_vals, na.rm = TRUE))
+}
+
+results <- param_grid
+results$rmse <- NA
+ 
+for (i in seq_len(nrow(param_grid))) {
+  params <- param_grid[i, ]
+  cat("Evaluating:", i, "/", nrow(param_grid), 
+      "| alpha =", params$alpha, 
+      "| beta =", params$beta, 
+      "| kappa =", params$kappa, "\n")
+  
+  results$rmse[i] <- evaluate_param_combo(
+    alpha = params$alpha,
+    beta = params$beta,
+    kappa = params$kappa,
+    n_reps = 200 
+  )
+}
+
+
+results_grid_search3 <-results 
+best_result <- results[which.min(results$rmse), ]
+print(best_result)
+
+
+```
+
+```{r}
+
+beta_vals     <- c(0,1,2,3)
+alpha_vals     <- c(0.0001, 0.2)
+
+skew_vals     <- seq(-10, 10, length.out = 5)
+normality_vals <- seq(0, 1, length.out = 5)
+
+param_grid <- expand.grid(beta = beta_vals, skewness = skew_vals, normality_weight = normality_vals, alpha=alpha_vals)
+
+# Set constants
+dt <- 1
+n_steps <- 75
+x0 <- c(-200, 2, 0, 2000, 5, 0)
+
+R_scale <- 1
+Q_scale <- 5
+
+sigma_a <- 0.5
+q <- sigma_a^2
+
+Q_block <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+Q <- matrix(0, nrow = 6, ncol = 6)
+Q[1:3, 1:3] <- Q_block
+Q[4:6, 4:6] <- Q_block
+Q <- Q * 0.001
+
+evaluate_param_combo <- function(alpha, beta, skewness, normality_weight) {
+  rmse_vals <- numeric(n_reps)
+  for (i in seq_len(n_reps)) {
+    repeat {
+      sim_data <- simulate_flight(x0, n_steps, Q)
+      if (all(sim_data$py > 0)) break
+    }
+
+    R_tri <- diag(c(50, 50)) * R_scale
+    R_radar <- diag(c(50, 0.00005)) * R_scale
+
+    sim_data_noisy <- add_noise(sim_data, R_tri, R_radar,
+                                skewness = skewness,
+                                normality_weight = normality_weight)
+
+    Q_matrix <- Q + diag(0.5, 6)
+
+    result <- run_UKF(sim_data_noisy,
+                      alpha = alpha,
+                      beta = beta,
+                      kappa = 0,
+                      Q = Q_matrix,
+                      R = R_tri,
+                      x0 = x0)
+
+    rmse_vals[i] <- sqrt(mean((result$x - sim_data$px)^2 + (result$y - sim_data$py)^2))
+  }
+  return(mean(rmse_vals, na.rm = TRUE))
+}
+
+results <- param_grid
+results$rmse <- NA
+
+for (i in seq_len(nrow(param_grid))) {
+  params <- param_grid[i, ]
+  cat("Evaluating:", i, "/", nrow(param_grid),
+      "| beta =", params$beta,
+      "| skewness =", params$skewness,
+      "| normality_weight =", params$normality_weight, "\n")
+
+  results$rmse[i] <- evaluate_param_combo(
+    beta = params$beta,
+    alpha = params$alpha,
+    skewness = params$skewness,
+    normality_weight = params$normality_weight,
+    n_reps = 500
+  )
+}
+
+results_grid_search_noise <- results
+best_result <- results[which.min(results$rmse), ]
+print(best_result)
+
+```
+
+## kurtosis heatmap
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+
+df_skewness <- results_grid_search_noise %>%
+  filter(normality_weight == 1)  
+
+ggplot(df_skewness, aes(x = skewness, y = rmse, color = as.factor(beta), group = beta)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "RMSE vs Skewness (Normality weight = 0.00)",
+    x = "Skewness (α)",
+    y = "RMSE",
+    color = "Beta"
+  ) +
+  theme_minimal()
+
+
+```
+```{r}
+
+df_normality <- results_grid_search_noise %>%
+  filter(skewness == 0)
+
+ggplot(df_normality, aes(x = normality_weight, y = rmse, color = as.factor(beta), group = beta)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "RMSE vs Normality Weight (Skewness = 0)",
+    x = "Normality Weight (ρ)",
+    y = "RMSE",
+    color = "Beta"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+## distributions
+
+```{r}
+
+library(extraDistr)
+library(distr)
+
+simulate_flight_dist <- function(x0, n_steps, Q_diag, noise_dist = "normal") {
+  dt <- 1
+
+
+  F <- matrix(c(
+    1, dt, 0.5*dt^2, 0,  0,        0,
+    0,  1,       dt, 0,  0,        0,
+    0,  0,        1, 0,  0,        0,
+    0,  0,        0, 1, dt, 0.5*dt^2,
+    0,  0,        0, 0,  1,       dt,
+    0,  0,        0, 0,  0,        1
+  ), nrow = 6, byrow = TRUE)
+
+
+  gen_noise <- function(sd, n, dist) {
+    if (dist == "normal") {
+      rnorm(n, mean = 0, sd = sd)
+      
+    } else if (dist == "uniform") {
+      runif(n, min = -sqrt(3)*sd, max = sqrt(3)*sd)
+      
+    } else if (dist == "t-distribution") {
+      df <- 5
+      scale <- sd * sqrt((df - 3) / df)
+      rt(n, df) * scale
+      
+    } else if (dist == "laplace") {
+        b <- sd / sqrt(2)
+        rlaplace(n, 0,  b)
+      
+    } else if (dist == "triangular") {
+        triangle_std <- sqrt(6) * sd
+        a <- -triangle_std
+        b <- triangle_std
+        rtriangle(n = n, a = a, b = b, c = 0)
+      
+    } else {
+      stop("Unsupported distribution.")
+    }
+  }
+
+  state <- matrix(NA, nrow = n_steps, ncol = length(x0))
+  state[1, ] <- x0
+
+  sd_ax <- sqrt(Q_diag[3, 3])
+  sd_ay <- sqrt(Q_diag[6, 6])
+
+  ax_noise <- gen_noise(sd_ax, n_steps - 1, noise_dist)
+  ay_noise <- gen_noise(sd_ay, n_steps - 1, noise_dist)
+
+  for (k in 2:n_steps) {
+
+      noise_vec <- c(
+      0.5 * ax_noise[k - 1], ax_noise[k - 1], ax_noise[k - 1],
+      0.5 * ay_noise[k - 1], ay_noise[k - 1], ay_noise[k - 1]
+    )
+    state[k, ] <- F %*% state[k - 1, ] + noise_vec
+  }
+
+  # Return as data frame
+  return(data.frame(
+    time = 1:n_steps,
+    px = state[, 1],
+    vx = state[, 2],
+    ax = state[, 3],
+    py = state[, 4],
+    vy = state[, 5],
+    ay = state[, 6]
+  ))
+}
+
+
+
+
+simulate_flight <- function(x0, n_steps, Q) {  #constant acceleration nmodel
+  dt <- 1
+  
+  F <- matrix(c(
+    1, dt, 0.5*dt^2, 0,  0,        0,
+    0,  1,       dt, 0,  0,        0,
+    0,  0,        1, 0,  0,        0,
+    0,  0,        0, 1, dt, 0.5*dt^2,
+    0,  0,        0, 0,  1,       dt,
+    0,  0,        0, 0,  0,        1
+  ), nrow = 6, byrow = TRUE)
+
+  state <- matrix(NA, nrow = n_steps, ncol = length(x0)) 
+  state[1, ] <- x0
+
+  noise <- MASS::mvrnorm(n_steps - 1, mu = rep(0, 6), Sigma = Q) #add in noise
+
+  for (k in 2:n_steps) {
+    state[k, ] <- F %*% state[k - 1, ] + noise[k - 1, ]
+  }
+
+  return(data.frame(
+    time = 1:n_steps,
+    px = state[, 1],
+    vx = state[, 2],
+    ax = state[, 3],
+    py = state[, 4],
+    vy = state[, 5],
+    ay = state[, 6]
+  ))
+}
+
+add_noise_dist <- function(sim_data, R_tri, R_radar, distribution = "normal") {
+  library(sn)       # for skew-normal (optional fallback)
+  library(LaplacesDemon)  # for Laplace distribution
+
+  px <- sim_data$px
+  py <- sim_data$py
+  n <- length(px)
+
+  gen_noise <- function(sd, n, distribution) {
+    if (distribution == "normal") {
+      rnorm(n, mean = 0, sd = sd)
+
+    } else if (distribution == "uniform") {
+      a <- -sqrt(3) * sd  # mean 0, sd = sd
+      b <-  sqrt(3) * sd
+      runif(n, min = a, max = b)
+
+    } else if (distribution == "t-distribution") {
+      df <- 4
+      scale <- sd * sqrt((df - 3) / df)
+      rt(n, df) * scale
+
+    } else if (distribution == "laplace") {
+        b <- sd / sqrt(2)
+        rlaplace(n, 0,  b)
+      
+
+    } else if (distribution == "triangular") {
+        triangle_std <- sqrt(6) * sd
+        a <- -triangle_std
+        b <- triangle_std
+        rtriangle(n = n, a = a, b = b, c = 0)
+
+    } else {
+      stop("Unsupported distribution type.")
+    }
+  }
+
+  d1 <- sqrt((px + 600)^2 + py^2) + gen_noise(sqrt(R_tri[1, 1]), n, distribution)
+  d2 <- sqrt((px - 600)^2 + py^2) + gen_noise(sqrt(R_tri[2, 2]), n, distribution)
+  d  <- sqrt(px^2 + py^2)         + gen_noise(sqrt(R_radar[1, 1]), n, distribution)
+  theta <- atan2(py, px)         + gen_noise(sqrt(R_radar[2, 2]), n, distribution)
+
+  sim_data$d1 <- d1
+  sim_data$d2 <- d2
+  sim_data$d  <- d
+  sim_data$theta <- theta
+
+  return(sim_data)
+}
+
+
+library(dplyr)
+
+dt <- 1
+n_steps <- 75
+sigma_a <- 0.05
+alpha <- 0.2
+kappa <- 0
+q_2D <- sigma_a^2
+
+
+beta_vals <- c(0, 1, 2, 3, 4, 5)
+R_scales <- c(1)
+distributions <- c("normal", "uniform", "t-distribution", "laplace", "triangular")
+
+param_grid <- expand.grid(
+  beta = beta_vals,
+  R_scale = R_scales,
+  distribution = distributions,
+  stringsAsFactors = FALSE
+)
+
+
+results_all <- data.frame(
+  beta = integer(),
+  distribution = character(),
+  R_scale = numeric(),
+  rep = integer(),
+  RMSE = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+
+
+
+evaluate_dist_combo <- function(beta, R_scale, distribution) {
+  x0 <- c(-200, 2, 0, 2000, 5, 0)
+  
+  Q_block <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE)
+
+  Q <- matrix(0, nrow = 6, ncol = 6)
+  Q[1:3, 1:3] <- Q_block
+  Q[4:6, 4:6] <- Q_block
+  Q <- Q * q_2D
+  Q_diag <- diag(c(0, 0, sigma_a^2, 0, 0, sigma_a^2))
+  
+  repeat {
+    sim_data <- simulate_flight_dist(x0, n_steps, Q_diag, noise_dist = distribution)
+    if (all(sim_data$py > 0)) break
+  }
+
+  R_tri <- diag(c(50, 50)) * R_scale
+  R_radar <- diag(c(1, 1)) * R_scale
+
+  sim_data_noisy <- add_noise_dist(sim_data, R_tri = R_tri, R_radar = R_radar, distribution = distribution)
+
+  Q_matrix <- Q + diag(0.5, 6)
+  result <- run_UKF(
+    sim_data_noisy,
+    alpha = alpha,
+    beta = beta,
+    kappa = kappa,
+    Q = Q_matrix,
+    R = R_tri,
+    x0 = x0
+  )
+
+  compute_metrics(
+    true_x = sim_data$px,
+    est_x  = result$x,
+    true_y = sim_data$py,
+    est_y  = result$y
+  )
+}
+
+# Evaluate grid
+n_reps <- 1000
+results <- param_grid
+results$MaxAE <- NA
+results$MAE <- NA
+results$RMSE <- NA
+
+
+
+
+for (i in seq_len(nrow(param_grid))) {
+  params <- param_grid[i, ]
+  cat("Evaluating:", i, "/", nrow(param_grid),
+      "| beta =", params$beta,
+      "| R_scale =", params$R_scale,
+      "| distribution =", params$distribution, "\n")
+  
+  metrics_mat <- replicate(n_reps, {
+    res <- evaluate_dist_combo(
+      beta = params$beta,
+      R_scale = params$R_scale,
+      distribution = params$distribution
+    )
+    as.numeric(res)
+  })
+  
+  metrics_avg <- rowMeans(metrics_mat, na.rm = TRUE)
+  results$MaxAE[i] <- metrics_avg[1]
+  results$MAE[i]   <- metrics_avg[2]
+  results$RMSE[i]  <- metrics_avg[3]
+
+  # Store individual RMSE values for boxplot analysis
+  rmse_vec <- metrics_mat[3, ]  # Assuming RMSE is the 3rd row
+  temp_df <- data.frame(
+    beta = params$beta,
+    distribution = params$distribution,
+    R_scale = params$R_scale,
+    rep = seq_along(rmse_vec),
+    RMSE = rmse_vec
+  )
+  results_all <- rbind(results_all, temp_df)
+}
+
+
+
+
+
+```
+
+
+```{r}
+library(ggplot2)
+
+results_all$beta <- as.factor(results_all$beta)
+
+ggplot(results_all, aes(x = beta, y = RMSE)) +
+  geom_boxplot(fill = "lightgray", outlier.alpha = 0.3) +
+  facet_wrap(~ distribution, scales = "free_y") +
+  labs(
+    title = "RMSE Distribution by Beta per Noise Type",
+    x = expression(beta),
+    y = "RMSE"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold")
+  )
+
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+results_rescaled <- results %>%
+  group_by(distribution, R_scale) %>%
+  mutate(
+    RMSE_rescaled = 100 * RMSE / max(RMSE, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+results_rescaled$beta <- as.factor(results_rescaled$beta)
+
+
+ggplot(results_rescaled, aes(x = R_scale, y = RMSE_rescaled, color = beta, group = beta)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ distribution, scales = "fixed") +
+  labs(
+    title = "Relative RMSE Performance of Beta (Scaled to Max = 100)",
+    x = "R_scale",
+    y = "Relative RMSE (%)",
+    color = expression(beta)
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+```
+
+
+
+# Augmented Matrix: Covariance Testing
+
+
+```{r}
+
+
+simulate_flight_cor <- function(x0, n_steps, Q) {  
+  dt <- 1
+  
+  F <- matrix(c(
+    1, dt, 0.5*dt^2, 0, 0, 0,
+    0, 1, dt, 0, 0, 0,
+    0, 0, 1, 0, 0, 0,
+    0, 0, 0, 1, dt, 0.5*dt^2,
+    0, 0, 0, 0, 1, dt,
+    0, 0, 0, 0, 0, 1
+  ), nrow = 6, byrow = TRUE)
+
+  state <- matrix(NA, nrow = n_steps, ncol = length(x0))
+  state[1, ] <- x0
+
+  noise <- MASS::mvrnorm(n_steps - 1, mu = rep(0, 6), Sigma = Q)
+  
+  for (k in 2:n_steps) {
+    state[k, ] <- F %*% state[k - 1, ] + noise[k - 1, ]
+  }
+  
+  # Expand noise to match full n_steps
+  process_noise_full <- rbind(rep(0, 6), noise)
+  
+  return(list(
+    sim_data = data.frame(
+      time = 1:n_steps,
+      px = state[, 1],
+      vx = state[, 2],
+      ax = state[, 3],
+      py = state[, 4],
+      vy = state[, 5],
+      ay = state[, 6]
+    ),
+    process_noise = process_noise_full
+  ))
+}
+
+
+
+
+add_noise_cor <- function(sim_data, process_noise, R_tri, R_radar, skewness = 0, normality_weight = 1, cor_strength = 0) {
+  library(sn)
+  
+  px <- sim_data$px
+  py <- sim_data$py
+  n <- length(px)
+  
+  ax_noise <- process_noise[, 3]
+  ay_noise <- process_noise[, 6]
+
+  gen_noise <- function(sd, n, skewness, normality_weight) {
+    alpha <- skewness
+    delta <- alpha / sqrt(1 + alpha^2)
+
+    omega <- sd / sqrt(1 - (2 * delta^2 / pi))
+    xi <- -omega * delta * sqrt(2 / pi)
+
+    skew_part <- rsn(n, xi = xi, omega = omega, alpha = alpha)
+
+    if (normality_weight < 1) {
+      range <- sqrt(12 * sd^2 * (1 - normality_weight^2) / (1 - normality_weight)^2)
+      unif_part <- runif(n, min = -range / 2, max = range / 2)
+    } else {
+      unif_part <- rep(0, n)
+    }
+
+    normality_weight * skew_part + (1 - normality_weight) * unif_part
+  }
+
+  # Generate "independent" noise
+  noise_d1 <- gen_noise(sqrt(R_tri[1, 1]), n, skewness, normality_weight)
+  noise_d2 <- gen_noise(sqrt(R_tri[2, 2]), n, skewness, normality_weight)
+  noise_d  <- gen_noise(sqrt(R_radar[1, 1]), n, skewness, normality_weight)
+  noise_theta <- gen_noise(sqrt(R_radar[2, 2]), n, skewness, normality_weight)
+
+  ax_noise_rescaled <- scale(ax_noise) * sqrt(R_tri[1,1])
+  ay_noise_rescaled <- scale(ay_noise) * sqrt(R_radar[2,2])
+
+  d1 <- sqrt((px + 600)^2 + py^2) + (1 - cor_strength) * noise_d1 + cor_strength * ax_noise_rescaled
+  d2 <- sqrt((px - 600)^2 + py^2) + (1 - cor_strength) * noise_d2 + cor_strength * ax_noise_rescaled
+  d  <- sqrt(px^2 + py^2) + (1 - cor_strength) * noise_d + cor_strength * ax_noise_rescaled
+  theta <- atan2(py, px) + (1 - cor_strength) * noise_theta + cor_strength * ay_noise_rescaled
+
+
+  sim_data$d1 <- d1
+  sim_data$d2 <- d2
+  sim_data$d  <- d
+  sim_data$theta <- theta
+
+  return(sim_data)
+}
+
+
+```
+
+
+
+```{r}
+
+library(dplyr)
+
+cor_strength_vals <- seq(0, 1, length.out = 5)  
+
+param_grid <- expand.grid(cor_strength = cor_strength_vals)
+
+dt <- 1
+n_simulations <- 10
+n_steps <- 100
+x0 <- c(-200, 2, 0, 2000, 5, 0)
+
+R_scale <- 1  
+sigma_a <- 0.5
+q <- sigma_a^2
+
+Q_block <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+Q <- matrix(0, nrow = 6, ncol = 6)
+Q[1:3, 1:3] <- Q_block
+Q[4:6, 4:6] <- Q_block
+
+Q = Q*0.001
+
+evaluate_cor_combo <- function(cor_strength, n_reps = 10) {
+  rmse_UKF <- numeric(n_reps)
+  rmse_UKF_aug <- numeric(n_reps)
+
+  for (i in seq_len(n_reps)) {
+    
+    repeat {
+      sim_result <- simulate_flight_cor(x0, n_steps, Q)
+      sim_data <- sim_result$sim_data
+      process_noise <- sim_result$process_noise
+      if (all(sim_data$py > 0)) break
+    }
+
+    R_tri <- diag(c(50, 50)) * R_scale
+    R_radar <- diag(c(50, 0.00005)) * R_scale
+
+    sim_data_noisy <- add_noise_cor(
+      sim_data, 
+      process_noise, 
+      R_tri, 
+      R_radar, 
+      skewness = 0, 
+      normality_weight = 1, 
+      cor_strength = cor_strength
+    )
+
+    Q_matrix <- Q + diag(0.5, 6)  
+
+    result_ukf <- run_UKF(sim_data_noisy, alpha = 0.01, beta = 2, kappa = 0, Q = Q_matrix, R = R_tri, x0 = x0)
+    result_ukf_aug <- run_UKF_aug(sim_data_noisy, alpha = 0.01, beta = 2, kappa = 0, Q = Q_matrix, R = R_tri, x0 = x0)
+
+    rmse_UKF[i] <- sqrt(mean((result_ukf$x - sim_data$px)^2 + (result_ukf$y - sim_data$py)^2))
+    rmse_UKF_aug[i] <- sqrt(mean((result_ukf_aug$x - sim_data$px)^2 + (result_ukf_aug$y - sim_data$py)^2))
+  }
+
+  return(c(
+    mean(rmse_UKF, na.rm = TRUE),
+    mean(rmse_UKF_aug, na.rm = TRUE)
+  ))
+}
+
+results <- param_grid %>%
+  mutate(
+    RMSE_UKF = NA_real_,
+    RMSE_UKF_aug = NA_real_,
+  )
+
+for (i in seq_len(nrow(results))) {
+  cat("Evaluating correlation strength:", results$cor_strength[i], "\n")
+  
+  rmse_vals <- evaluate_cor_combo(
+    cor_strength = results$cor_strength[i],
+    n_reps = 20
+  )
+
+  results$RMSE_UKF[i] <- rmse_vals[1]
+  results$RMSE_UKF_aug[i] <- rmse_vals[2]
+}
+
+
+
+
+
+
+```
+
+```{r}
+results_grid_search_cor <- results %>%
+  mutate(
+    Percent_Improvement = 100 * (RMSE_UKF - RMSE_UKF_aug) / RMSE_UKF
+  )
+
+print(results_grid_search_cor)
+```
+
+
+# Dimensionality Testing w/ Kappa
+
+## 1D and 3D Trajectory Generation
+
+```{r}
+
+
+## 
+
+simulate_flight_1D <- function(x0, n_steps, Q) {
+  dt <- 1
+  
+  F <- matrix(c(
+    1, dt, 0.5 * dt^2,
+    0,  1,       dt,
+    0,  0,        1
+  ), nrow = 3, byrow = TRUE)
+  
+  Q_sim <- matrix(0, nrow = 3, ncol = 3)
+  Q_sim[3, 3] <- Q[3, 3]
+
+  state <- matrix(NA, nrow = n_steps, ncol = length(x0))
+  state[1, ] <- x0
+
+  noise <- MASS::mvrnorm(n_steps - 1, mu = rep(0, 3), Sigma = Q_sim)
+
+  for (k in 2:n_steps) {
+    state[k, ] <- F %*% state[k - 1, ] + noise[k - 1, ]
+  }
+
+  return(data.frame(
+    time = 1:n_steps,
+    px = state[, 1],
+    vx = state[, 2],
+    ax = state[, 3]
+  ))
+}
+
+
+
+simulate_flight_3D <- function(x0, n_steps, Q) {
+  dt <- 1
+
+  F_block <- matrix(c(
+    1, dt, 0.5 * dt^2,
+    0,  1,       dt,
+    0,  0,        1
+  ), nrow = 3, byrow = TRUE)
+
+  F <- Matrix::bdiag(F_block, F_block, F_block)
+  F <- as.matrix(F)
+
+  Q_sim <- matrix(0, nrow = 9, ncol = 9)
+  Q_sim[3, 3] <- Q[3, 3]   # ax
+  Q_sim[6, 6] <- Q[6, 6]   # ay
+  Q_sim[9, 9] <- Q[9, 9]   # az
+
+  state <- matrix(NA, nrow = n_steps, ncol = length(x0))
+  state[1, ] <- x0
+
+  noise <- MASS::mvrnorm(n_steps - 1, mu = rep(0, 9), Sigma = Q_sim)
+
+  for (k in 2:n_steps) {
+    state[k, ] <- F %*% state[k - 1, ] + noise[k - 1, ]
+  }
+
+  return(data.frame(
+    time = 1:n_steps,
+    px = state[, 1],
+    vx = state[, 2],
+    ax = state[, 3],
+    py = state[, 4],
+    vy = state[, 5],
+    ay = state[, 6],
+    pz = state[, 7],
+    vz = state[, 8],
+    az = state[, 9]
+  ))
+}
+
+
+
+add_noise_1D <- function(sim_data, R) {
+  px <- sim_data$px
+  n <- length(px)
+  
+  noise <- rnorm(n, mean = 0, sd = sqrt(R))
+  sim_data$px_noisy <- px + noise
+  
+  return(sim_data)
+}
+
+
+
+add_noise_3D <- function(sim_data, R_tri, skewness = 0, normality_weight = 1) {
+  library(sn)
+  
+  px <- sim_data$px
+  py <- sim_data$py
+  pz <- sim_data$pz
+  n <- length(px)
+
+  gen_noise <- function(sd, n, skewness, normality_weight) {
+    alpha <- skewness
+    delta <- alpha / sqrt(1 + alpha^2)
+    omega <- sd / sqrt(1 - (2 * delta^2 / pi))
+    xi <- -omega * delta * sqrt(2 / pi)
+    skew_part <- rsn(n, xi = xi, omega = omega, alpha = alpha)
+    unif_part <- if (normality_weight < 1) {
+      range <- sqrt(12 * sd^2 * (1 - normality_weight^2) / (1 - normality_weight)^2)
+      runif(n, min = -range / 2, max = range / 2)
+    } else rep(0, n)
+    normality_weight * skew_part + (1 - normality_weight) * unif_part
+  }
+
+  d1 <- sqrt((px + 5000)^2 + py^2 + pz^2) + gen_noise(sqrt(R_tri[1, 1]), n, skewness, normality_weight)
+  d2 <- sqrt((px - 5000)^2 + py^2 + pz^2) + gen_noise(sqrt(R_tri[2, 2]), n, skewness, normality_weight)
+  d3 <- sqrt((px)^2 + (py - 5000)^2 + pz^2) + gen_noise(sqrt(R_tri[3, 3]), n, skewness, normality_weight)
+
+  sim_data$d1 <- d1
+  sim_data$d2 <- d2
+  sim_data$d3 <- d3
+  y <- t(as.matrix(cbind(d1, d2, d3)))
+  return(sim_data)
+}
+
+
+
+run_UKF_1D <- function(sim_data, alpha = 1, beta = 0, kappa = 2, Q, R, x0, h=h0) {
+  source("UKF_all_groundup_newweights.R")
+  library(numDeriv)
+
+  dt <- 1
+  
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],  # x position
+      x[2] + dt * x[3],                      # x velocity
+      x[3]                                   # x acceleration
+    )
+  }
+  
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2,
+      dt,
+      1
+    ), nrow = 3, ncol = 1)
+  }
+
+  y <- matrix(sim_data$px_noisy, nrow = 1)
+  h <- function(x) {
+    x[1] 
+  }
+  
+  P0 <- diag(rep(1, 3))
+
+  result <- unscentedkalmanf_all_newweights(y, f, B, Q, h, R, x0, P0, alpha, beta, kappa)
+
+  list(px = result$x.f[1, ])  #output filtered x position
+}
+
+
+
+
+run_UKF_3D <- function(sim_data, alpha = 1, beta = 0, kappa = 2, Q, R, x0) {
+  source("UKF_all_groundup_newweights.R")
+  library(numDeriv)
+
+  dt <- 1
+  
+  f_block <- function(pos, vel, acc) {
+    pos + vel * dt + 0.5 * dt^2 * acc
+  }
+  v_block <- function(vel, acc) {
+    vel + dt * acc
+  }
+
+  f <- function(x) {
+    c(
+      f_block(x[1], x[2], x[3]),
+      v_block(x[2], x[3]),
+      x[3],
+      f_block(x[4], x[5], x[6]),
+      v_block(x[5], x[6]),
+      x[6],
+      f_block(x[7], x[8], x[9]),
+      v_block(x[8], x[9]),
+      x[9]
+    )
+  }
+
+  B <- function(x) {
+    b_block <- matrix(c(
+      (dt^2)/2, 0,
+      dt, 0,
+      1, 0
+    ), nrow = 3, byrow = TRUE)
+    Matrix::bdiag(b_block, b_block, b_block) |> as.matrix()
+  }
+
+  d1 <- sim_data$d1
+  d2 <- sim_data$d2
+  d3 <- sim_data$d3
+  y <- t(as.matrix(cbind(d1, d2, d3)))
+
+  h <- function(x) {
+  px <- x[1]
+  py <- x[4]
+  pz <- x[7]
+  
+  d1 <- sqrt((px + 5000)^2 + py^2 + pz^2)  
+  d2 <- sqrt((px - 5000)^2 + py^2 + pz^2) 
+  d3 <- sqrt((px)^2 + (py-5000)^2 + pz^2) 
+  
+  return(c(d1, d2, d3))
+}
+  
+  P0 <- diag(rep(1, 9))
+
+  result <- unscentedkalmanf_all_newweights(y, f, B, Q, h, R, x0, P0, alpha, beta, kappa)
+
+  list(x = result$x.f[1, ],
+       y = result$x.f[4, ],
+       z = result$x.f[7, ])  # filtered positions
+}
+
+
+
+
+
+compute_metrics <- function(true_x, est_x, true_y = NULL, est_y = NULL, true_z = NULL, est_z = NULL) {
+  
+  #1d
+  if (is.null(true_y) && is.null(true_z)) {
+    abs_errors <- abs(est_x - true_x)
+  
+ #2d
+  } else if (!is.null(true_y) && is.null(true_z)) {
+    dx <- est_x - true_x
+    dy <- est_y - true_y
+    abs_errors <- sqrt(dx^2 + dy^2)
+  
+      #3d 
+  } else if (!is.null(true_y) && !is.null(true_z)) {
+    dx <- est_x - true_x
+    dy <- est_y - true_y
+    dz <- est_z - true_z
+    abs_errors <- sqrt(dx^2 + dy^2 + dz^2)
+  
+  } else {
+    stop("error")
+  }
+
+  MaxAE <- max(abs_errors)
+  MAE   <- mean(abs_errors)
+  MSE  <- mean(abs_errors^2)
+
+  return(c(MaxAE = MaxAE, MAE = MAE, MSE = MSE))
+}
+
+
+```
+
+## grid
+
+```{r}
+
+#    Define grid of kappas + dimensions
+
+
+kappa_vals <- seq(-10, 20, length.out = 31)
+dim_vals <- c(1, 2, 3)  # dimensionalities to test
+
+param_grid <- expand.grid(kappa = kappa_vals, dimension = dim_vals)
+
+
+#   Constants
+
+
+dt <- 1
+n_steps <- 75
+
+R_scale_1D <- 1
+R_scale <- 5
+R_scale_3D <- 10
+
+
+sigma_a <- 0.01   #acceleration noise std dev
+q_1D <- sigma_a^2
+
+sigma_a_2D <- 0.05  #acceleration noise std dev
+q_2D <- sigma_a^2
+
+sigma_a_3D <- .75  #acceleration noise std dev
+q_3D <- sigma_a^2
+
+
+
+######   main evaluation function
+
+evaluate_kappa_combo <- function(kappa, dimension) {
+  N <- dimension * 3
+  if ((N + kappa) <= 0) return(NA)  
+  
+  if (dimension == 1) {  ### dimension = 1
+    x0 <- c(-200, 2, 0)
+    Q_block <- matrix(c(
+      (dt^4)/4, (dt^3)/2, (dt^2)/2,
+      (dt^3)/2, dt^2,     dt,
+      (dt^2)/2, dt,       1
+    ), nrow = 3, byrow = TRUE)
+    
+    Q <- Q_block * q_1D
+
+    sim_data <- simulate_flight_1D(x0, n_steps, Q)
+    
+    R_1D <- 50 * R_scale
+    sim_data_noisy <- add_noise_1D(sim_data, R = R_1D)
+
+    Q_matrix <- Q + diag(0.5, 3)
+    result <- run_UKF_1D(sim_data_noisy,
+                         alpha = 0.001,
+                         beta = 2,
+                         kappa = kappa,
+                         Q = Q_matrix,
+                         R = matrix(50, nrow = 1),
+                         x0 = x0)
+    
+    return(compute_metrics(
+  true_x = sim_data$px,
+  est_x  = result$px))
+    
+  } else if (dimension == 2) { ### dimension = 2
+    x0 <- c(-200, 2, 0, 2000, 5, 0)
+    Q_block <- matrix(c(
+      (dt^4)/4, (dt^3)/2, (dt^2)/2,
+      (dt^3)/2, dt^2,     dt,
+      (dt^2)/2, dt,       1
+    ), nrow = 3, byrow = TRUE) 
+    
+    Q <- matrix(0, nrow = 6, ncol = 6)
+    
+    Q[1:3, 1:3] <- Q_block
+    Q[4:6, 4:6] <- Q_block
+    
+    Q <- Q * q_2D
+    
+    repeat {
+      sim_data <- simulate_flight(x0, n_steps, Q)
+      if (all(sim_data$py > 0)) break
+    }
+
+    R_tri <- diag(c(50, 50)) * R_scale
+    R_radar <- diag(c(1, 1)) * R_scale
+    
+    sim_data_noisy <- add_noise(sim_data, R_tri = R_tri, R_radar = R_radar)
+
+    Q_matrix <- Q + diag(0.5, 6)
+    result <- run_UKF(sim_data_noisy,
+                      alpha =0.001,
+                      beta = 2,
+                      kappa = kappa,
+                      Q = Q_matrix,
+                      R = R_tri,
+                      x0 = x0)
+
+    return(compute_metrics(
+      true_x = sim_data$px,
+      est_x  = result$x,
+      true_y = sim_data$py,
+      est_y  = result$y
+    ))
+    
+    
+  } else if (dimension == 3) {   ## dimension = 3
+    x0 <- c(-200, 2, 0, 1000, 4, 0, 10000, 10, 0)
+    Q_block <- matrix(c(
+      (dt^4)/4, (dt^3)/2, (dt^2)/2,
+      (dt^3)/2, dt^2,     dt,
+      (dt^2)/2, dt,       1
+    ), nrow = 3, byrow = TRUE) 
+    Q <- matrix(0, nrow = 9, ncol = 9)
+    Q[1:3, 1:3] <- Q_block
+    Q[4:6, 4:6] <- Q_block
+    Q[7:9, 7:9] <- Q_block
+    Q <- Q * q_3D
+
+    sim_data <- simulate_flight_3D(x0, n_steps, Q)
+
+    R_tri <- diag(c(50, 50, 50)) * R_scale_3D
+    sim_data_noisy <- add_noise_3D(sim_data, R_tri)
+
+    Q_matrix <- diag(10, 9) + Q * 10
+    result <- run_UKF_3D(sim_data_noisy,
+                         alpha = 0.001,
+                         beta = 2,
+                         kappa = kappa,
+                         Q = Q_matrix,
+                         R = R_tri,
+                         x0 = x0)
+
+    return(compute_metrics(
+      true_x = sim_data$px,
+      est_x  = result$x,
+      true_y = sim_data$py,
+      est_y  = result$y,
+      true_z = sim_data$pz,
+      est_z  = result$z
+      ))
+  }
+}
+
+
+library(dplyr)
+
+kappa_values <- seq(-2, 10, by = 1)
+dimensions <- c(1, 2, 3)
+
+n_reps <- 10
+
+results <- param_grid
+results$MaxAE <- NA
+results$MAE   <- NA
+results$MSE  <- NA
+
+for (i in seq_len(nrow(param_grid))) {
+  params <- param_grid[i, ]
+  cat("Evaluating:", i, "/", nrow(param_grid),
+      "| dimension =", params$dimension,
+      "| kappa =", params$kappa, "\n")
+  
+
+  metrics_mat <- replicate(n_reps, {
+    res <- evaluate_kappa_combo(
+      kappa = params$kappa,
+      dimension = params$dimension
+    )
+    as.numeric(res)
+  })
+  
+  if (is.null(dim(metrics_mat))) metrics_mat <- matrix(metrics_mat, ncol = 1)
+  
+  metrics_avg <- rowMeans(metrics_mat, na.rm = TRUE)
+  
+  results$MaxAE[i] <- metrics_avg[1]
+  results$MAE[i]   <- metrics_avg[2]
+  results$MSE[i]  <- metrics_avg[3]
+}
+
+
+```
+
+
+
+
+```{r}
+results_kappa_dimensionality <- results
+library(ggplot2)
+
+theoretical_kappa <- data.frame(
+  dimension = c(1, 2, 3),
+  kappa_theory = 3 - c(3, 6, 9)
+)
+
+
+#use MaxAE, MSE, or RMSE
+
+ggplot(results_kappa_dimensionality, aes(x = kappa, y = MSE)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ dimension, scales = "free_y", ncol = 1,
+             labeller = labeller(dimension = function(x) paste0(x, "D"))) +
+  labs(title = "MSE vs. Kappa by Model Dimension (α=1)",
+       x = expression(kappa),
+       y = "MSE") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "bold"))
+
+
+```
+
+
+
+
+# Sample 1D
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+dt <- 1
+n_steps <- 75
+sigma_a <- 0.1
+q <- sigma_a^2
+kappa <- -2 
+R_val <- 1
+
+x0 <- c(-200, 2, 0)
+
+Q <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q 
+
+sim_data <- simulate_flight_1D(x0, n_steps, Q)
+
+sim_data_noisy <- add_noise_1D(sim_data, R = R_val)
+
+Q_matrix <- Q + diag(0.5, 3)
+
+result <- run_UKF_1D(
+  sim_data_noisy,
+  alpha = 0.2,
+  beta = 2,
+  kappa = kappa,
+  Q = Q_matrix,
+  R = matrix(R_val, nrow = 1),
+  x0 = x0
+)
+
+library(ggplot2)
+library(dplyr)
+
+true_x <- sim_data$px
+filtered_x <- result$px
+measured_x <- sim_data_noisy$px_noisy
+time <- sim_data$time
+
+plot_df <- data.frame(
+  Time = time,
+  True_X = true_x,
+  Filtered_X = filtered_x,
+  Measured_X = measured_x
+)
+
+# Plot
+ggplot() +
+  geom_path(data = plot_df, aes(x = Time, y = True_X, color = "True Trajectory"), linetype = "dotted", size = 1) +
+  geom_path(data = plot_df, aes(x = Time, y = Filtered_X, color = "Filtered Trajectory"), size = 1) +
+  geom_point(data = plot_df, aes(x = Time, y = Measured_X, color = "Measurements"), shape = 4, size = 2) +
+  labs(
+    title = "1D Position: Observed, True, and Estimated Trajectory",
+    x = "Time",
+    y = "X Position",
+    color = "Legend"
+  ) +
+  scale_color_manual(values = c(
+    "True Trajectory" = "black",
+    "Filtered Trajectory" = "blue",
+    "Measurements" = "red"
+  )) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+```
+
+
+# sample trajectory graph 3D
+
+```{r}
+
+dimension <- 3
+kappa <- -6  
+
+sigma_a <- 0.75 
+q <- sigma_a^2
+
+
+R_scale <- 1
+
+x0 <- c(-200, 2, 0, 1000, 4, 0, 10000, 10, 0)
+
+Q_block <- matrix(c(
+      (dt^4)/4, (dt^3)/2, (dt^2)/2,
+      (dt^3)/2, dt^2,     dt,
+      (dt^2)/2, dt,       1
+    ), nrow = 3, byrow = TRUE) 
+
+
+
+
+Q <- matrix(0, nrow = 9, ncol = 9) * q
+Q[1:3, 1:3] <- Q_block
+Q[4:6, 4:6] <- Q_block
+Q[7:9, 7:9] <- Q_block
+Q <- Q*q
+
+sim_data <- simulate_flight_3D(x0, n_steps, Q)
+
+R_tri <- diag(c(50, 50, 50)) * R_scale
+
+sim_data_noisy <- add_noise_3D(sim_data, R_tri = R_tri)
+
+Q_matrix <- diag(10,9) + Q*10
+
+result <- run_UKF_3D(sim_data_noisy,
+                     alpha = 1,
+                     beta = 2,
+                     kappa = kappa,
+                     Q = Q_matrix,
+                     R = R_tri,
+                     x0 = x0)
+
+
+
+library(plotly)
+
+library(pracma)
+
+p1 <- c(-5000, 0, 0)
+p2 <- c(5000, 0, 0)
+p3 <- c(0, 5000, 0)
+
+measured_x <- measured_y <- measured_z <- numeric(nrow(sim_data_noisy))
+
+for (i in 1:nrow(sim_data_noisy)) {
+  d1 <- sim_data_noisy$d1[i]
+  d2 <- sim_data_noisy$d2[i]
+  d3 <- sim_data_noisy$d3[i]
+  
+  A <- rbind(
+    2 * (p2 - p1),
+    2 * (p3 - p1)
+  )
+  
+  b <- c(
+    d1^2 - d2^2 - sum(p1^2) + sum(p2^2),
+    d1^2 - d3^2 - sum(p1^2) + sum(p3^2)
+  )
+  
+  xy <- pinv(A) %*% b
+  x_est <- xy[1]
+  y_est <- xy[2]
+
+  z_est <- sqrt(max(0, d1^2 - (x_est - p1[1])^2 - (y_est - p1[2])^2))
+  
+  measured_x[i] <- x_est
+  measured_y[i] <- y_est
+  measured_z[i] <- z_est
+}
+
+true_x <- sim_data$px
+true_y <- sim_data$py
+true_z <- sim_data$pz
+
+filtered_x <- result$x
+filtered_y <- result$y
+filtered_z <- result$z
+
+fig <- plot_ly()
+
+fig <- fig %>%
+  add_trace(
+    x = true_x, y = true_y, z = true_z,
+    type = 'scatter3d', mode = 'lines+markers',
+    name = "True Trajectory",
+    line = list(width = 6, color = 'black', dash = 'dash'),
+    marker = list(size = 4, color = 'black', symbol = 'circle')
+  )
+
+fig <- fig %>%
+  add_trace(
+    x = filtered_x, y = filtered_y, z = filtered_z,
+    type = 'scatter3d', mode = 'lines+markers',
+    name = "Filtered Trajectory",
+    line = list(width = 4, color = 'blue'),
+    marker = list(size = 3, color = 'blue', symbol = 'diamond')
+  )
+
+fig <- fig %>%
+  add_trace(
+    x = measured_x, y = measured_y, z = measured_z,
+    type = 'scatter3d', mode = 'markers',
+    name = "Measurements",
+    marker = list(size = 3, color = 'red', symbol = 'x')
+  )
+
+fig <- fig %>%
+  layout(
+    title = "3D Trajectory: True, Filtered, and Measurements",
+    scene = list(
+      xaxis = list(title = 'X Position'),
+      yaxis = list(title = 'Y Position'),
+      zaxis = list(title = 'Z Position')
+    )
+  )
+
+fig
+
+rmse_3d <- sqrt(mean(
+  (filtered_x - true_x)^2 +
+  (filtered_y - true_y)^2 +
+  (filtered_z - true_z)^2
+))
+print(rmse_3d)
+
+```
+
+
+
+
+# alpha vs process variance
+
+
+```{r}
+
+#    Define grid of kappas + dimensions
+evaluate_ukf_combo <- function(alpha, beta, kappa, sigma_a, normality_weight) {
+  q_2D <- sigma_a^2
+  x0 <- c(-200, 2, 0, 2000, 5, 0)
+  
+  Q_block <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) 
+  
+  Q <- matrix(0, nrow = 6, ncol = 6)
+  Q[1:3, 1:3] <- Q_block
+  Q[4:6, 4:6] <- Q_block
+  Q <- Q * q_2D
+
+  repeat {
+    sim_data <- simulate_flight(x0, n_steps, Q)
+    if (all(sim_data$py > 0)) break
+  }
+
+  R_tri <- diag(c(50, 50)) * R_scale
+  R_radar <- diag(c(1, 1)) * R_scale
+
+  sim_data_noisy <- add_noise(
+    sim_data,
+    R_tri = R_tri,
+    R_radar = R_radar,
+    skewness = 0,
+    normality_weight = normality_weight
+  )
+
+  Q_matrix <- Q + diag(0.5, 6)
+  result <- run_UKF(
+    sim_data_noisy,
+    alpha = alpha,
+    beta = beta,
+    kappa = kappa,
+    Q = Q_matrix,
+    R = R_tri,
+    x0 = x0
+  )
+
+  compute_metrics(
+    true_x = sim_data$px,
+    est_x  = result$x,
+    true_y = sim_data$py,
+    est_y  = result$y
+  )
+}
+
+
+
+
+alpha_vals <- seq(0.001, 1, length.out = 10)
+sigma_a_vals <- seq(0.00005, 1, length.out = 10)
+kappa_vals <- c(0)
+beta_vals <- c(0, 2)  # common choices: 0 for non-Gaussian, 2 for Gaussian
+normality_weights <- seq(0, 1, length.out = 10)  # 0 = uniform, 1 = normal
+
+param_grid <- expand.grid(
+  alpha = alpha_vals,
+  beta = beta_vals,
+  kappa = kappa_vals,
+  sigma_a = sigma_a_vals,
+  normality_weight = normality_weights
+)
+
+
+
+#   Constants
+
+
+dt <- 1
+n_steps <- 5
+
+R_scale_1D <- 0.11
+R_scale <- 5
+R_scale_3D <- 10
+
+
+
+
+
+######   main evaluation function
+
+library(dplyr)
+
+n_reps <- 5000  
+results <- param_grid
+results$MaxAE <- NA
+results$MAE <- NA
+results$RMSE <- NA
+
+for (i in seq_len(nrow(param_grid))) {
+  params <- param_grid[i, ]
+  cat("Evaluating:", i, "/", nrow(param_grid),
+      "| alpha =", params$alpha,
+      "| beta =", params$beta,
+      "| kappa =", params$kappa,
+      "| sigma_a =", params$sigma_a,
+      "| normality_weight =", params$normality_weight, "\n")
+  
+  metrics_mat <- replicate(n_reps, {
+    res <- evaluate_ukf_combo(
+      alpha = params$alpha,
+      beta = params$beta,
+      kappa = params$kappa,
+      sigma_a = params$sigma_a,
+      normality_weight = params$normality_weight
+    )
+    as.numeric(res)
+  })
+  
+  metrics_avg <- rowMeans(metrics_mat, na.rm = TRUE)
+  
+  results$MaxAE[i] <- metrics_avg[1]
+  results$MAE[i] <- metrics_avg[2]
+  results$RMSE[i] <- metrics_avg[3]
+}
+
+
+
+library(dplyr)
+
+
+
+
+```
+
+
+
+
+```{r}
+results_kappa_dimensionality <- results
+library(ggplot2)
+
+theoretical_kappa <- data.frame(
+  dimension = c(1, 2, 3),
+  kappa_theory = 3 - c(3, 6, 9)
+)
+
+
+#use MaxAE, MSE, or RMSE
+
+library(dplyr)
+library(ggplot2)
+
+# Ensure sigma_a is treated as continuous
+optimal_alpha_per_sigma <- results %>%
+  group_by(sigma_a) %>%
+  slice_min(RMSE, with_ties = FALSE)  # Get row with lowest RMSE per sigma_a
+
+ggplot(optimal_alpha_per_sigma, aes(x = sigma_a, y = alpha)) +
+  geom_line(size = 1) +
+  geom_point(size = 2, color = "blue") +
+  labs(
+    title = "Optimal Alpha per Sigmaₐ (Based on Minimum RMSE)",
+    x = expression(sigma[a]),
+    y = expression(alpha[optimal])
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+
+
+```
+
+
+```{r}
+library(ggplot2)
+
+ggplot(results, aes(x = normality_weight, y = alpha, fill = RMSE)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "D", name = "RMSE") +
+  labs(
+    title = "RMSE Heatmap across α and σₐ",
+    x = expression(sigma[a]~"(Process Noise Std Dev)"),
+    y = expression(alpha~"(UKF Spread Parameter)")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
+  )
+
+
+
+```
+```{r}
+
+# evaluate_ukf_combo <- function(alpha, beta, kappa, sigma_a, normality_weight) {
+
+lm_rmse <- lm(RMSE ~ alpha * sigma_a + normality_weight*alpha , data = results)
+summary(lm_rmse)
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Step 1: Find optimal alpha per (sigma_a, normality_weight) pair
+optimal_alpha_heatmap <- results %>%
+  select(-kappa, -beta) %>%
+  group_by(sigma_a, normality_weight) %>%
+  slice_min(order_by = RMSE, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Step 2: Plot heatmap
+ggplot(optimal_alpha_heatmap, aes(x = sigma_a, y = normality_weight, fill = alpha)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = expression(alpha[optimal])) +
+  labs(
+    title = expression("Optimal " * alpha * " Heatmap by " * sigma[a] * " and Normality Weight"),
+    x = expression(sigma[a]),
+    y = "Normality Weight"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+
+```
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Step 1: Find optimal alpha per (sigma_a, normality_weight) pair
+optimal_alpha_heatmap <- results %>%
+  select(-kappa, -beta) %>%
+  group_by(sigma_a, normality_weight) %>%
+  slice_min(order_by = RMSE, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Step 2: Plot heatmap
+ggplot(optimal_alpha_heatmap, aes(x = sigma_a, y = normality_weight, fill = alpha)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = expression(alpha[optimal])) +
+  labs(
+    title = expression("Optimal " * alpha * " Heatmap by " * sigma[a] * " and Normality Weight"),
+    x = expression(sigma[a]),
+    y = "Normality Weight"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Summarize average RMSE for each (alpha, sigma_a) pair
+rmse_grid <- results %>%
+  group_by(alpha, sigma_a) %>%
+  summarise(mean_RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop")
+
+# Create the heatmap
+ggplot(rmse_grid, aes(x = sigma_a, y = alpha, fill = mean_RMSE)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = "Avg RMSE") +
+  labs(
+    title = "Heatmap of Average RMSE by Alpha and Sigmaₐ",
+    x = expression(sigma[a]),
+    y = expression(alpha)
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Summarize RMSE for each combo of sigma_a, normality_weight, and alpha
+rmse_facet_data <- results %>%
+  group_by(sigma_a, normality_weight, alpha) %>%
+  summarise(mean_RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop")
+
+# Plot
+ggplot(rmse_facet_data, aes(x = normality_weight, y = mean_RMSE, color = as.factor(alpha), group = alpha)) +
+  geom_line(size = 1) +
+  facet_wrap(~ sigma_a, scales = "free_y", ncol = 4, labeller = label_both) +
+  labs(
+    title = "RMSE vs. Normality Weight for Different α Values (Faceted by σₐ)",
+    x = "Normality Weight (0 = Uniform, 1 = Normal)",
+    y = "Average RMSE",
+    color = expression(alpha)
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    strip.text = element_text(face = "bold")
+  )
+
+
+```
+
+
+# normality testing
+
+
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(moments)  # for skewness and kurtosis
+
+
+
+
+mu <- 5000
+a  <- 0.002
+
+h1 <- function(x) x 
+h2 <- function(x) atan((x+300) / 10000)
+h3 <- function(x) sign(x + 70) * abs(x + 70)^3 * 20
+h4 <- function(x) (x+50)^4   
+h5 <- function(x) sign(x ) * abs(x)^6 * 0.0001   # 6th power
+
+
+
+h1_inv <- function(y) y
+h2_inv <- function(y)  tan(y) * 10000 - 300 
+h3_inv <- function(y) sign(y) * abs(y / 20)^(1 / 3) - 70
+h4_inv <- function(y) sign(y) * abs(y)^(1/4) - 50
+h5_inv <- function(y) sign(y - 5000) * abs((y ) / 0.0001)^(1/6) 
+
+
+
+measurement_funcs <- list(
+  "h1" = h1,
+  "h2" = h2,
+  "h3" = h3,
+  "h4" = h4,
+  "h5" = h5
+  )
+
+inverse_funcs <- list(
+  "h1" = h1_inv,
+  "h2" = h2_inv,
+  "h3" = h3_inv,
+  "h4" = h4_inv,
+  "h5" = h5_inv
+)
+
+# Simulate
+true_x <- 5000
+
+for (label in names(measurement_funcs)) {
+  h     <- measurement_funcs[[label]]
+  h_inv <- inverse_funcs[[label]]
+  
+  # Get measurement-space value
+  m_value <- true_x
+  
+  # Invert back to estimate a measurement-space input mean
+  inv_mean <- h(m_value)
+  sd       <- 0.3 * abs(inv_mean)
+  
+  # Simulate values near this inverse
+  simulated_states <- rnorm(500000, mean = inv_mean, sd = sd)
+  
+  # Now apply h_inv() to simulate interpreted positions
+  final_measurements <- h_inv(simulated_states)
+  
+  plot_data <- data.frame(value = final_measurements)
+  
+  cat(paste0(label, " — Skewness: ", round(skewness(final_measurements), 3), 
+             ", Kurtosis: ", round(kurtosis(final_measurements), 3), "\n"))
+  
+  print(
+    ggplot(plot_data, aes(x = value)) +
+      geom_density(fill = "steelblue", alpha = 0.7) +
+      theme_minimal(base_size = 14) +
+      labs(
+        title = paste("Final Measurement Distribution for", label),
+        x = "Measurement Value",
+        y = "Density"
+      )
+  )
+}
+
+
+```
+
+## all hs
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(purrr)
+library(moments)
+
+# Define h functions
+h_funcs <- list(
+  h1 = function(x) x,
+  h2 = function(x) atan((x + 300) / 10000),
+  h3 = function(x) sign(x + 70) * abs(x + 70)^3 * 20,
+  h4 = function(x) (x + 50)^4,
+  h5 = function(x) sign(x) * abs(x)^6 * 0.0001
+)
+
+# Define inverse functions
+h_inv_funcs <- list(
+  h1 = function(y) y,
+  h2 = function(y) tan(y) * 10000 - 300,
+  h3 = function(y) sign(y) * abs(y / 20)^(1 / 3) - 70,
+  h4 = function(y) sign(y) * abs(y)^(1/4) - 50,
+  h5 = function(y) sign(y) * abs(y / 0.0001)^(1/6)
+)
+
+# Measurement noise multipliers
+r_multipliers <- c(h1 = 1.0, h2 = 0.8, h3 = 3.0, h4 = 4.0, h5 = 7.1) * 0.03
+
+# Simulate and collect results
+set.seed(1)
+true_x <- 1000
+
+plot_data <- map_dfr(names(h_funcs), function(name) {
+  h     <- h_funcs[[name]]
+  h_inv <- h_inv_funcs[[name]]
+  R_mult <- r_multipliers[[name]]
+
+  inv_mean <- h(true_x)
+  sd <- R_mult * abs(inv_mean)
+  sim_vals <- rnorm(500000, mean = inv_mean, sd = sd)
+  
+  # Clamp invalid values for functions with domain restrictions
+  if (name %in% c("h4", "h5")) {
+    sim_vals <- sim_vals[sim_vals > 0]
+  }
+
+  final_meas <- h_inv(sim_vals)
+
+  data.frame(
+    value = final_meas,
+    func_name = name
+  )
+})
+
+# Compute kurtosis by group and create formatted labels
+kurtosis_labels <- plot_data %>%
+  filter(value >= 0) %>%
+  group_by(func_name) %>%
+  summarise(kurt = kurtosis(value)) %>%
+  mutate(label = paste0(func_name, "\nKurtosis = ", round(kurt, 2))) %>%
+  deframe()
+
+# Plot
+ggplot(plot_data, aes(x = value)) +
+  geom_density(fill = "darkcyan", alpha = 0.7) +  #slateblue2
+  facet_wrap(
+    ~ func_name,
+    scales = "free",
+    ncol = 5,
+    labeller = labeller(func_name = kurtosis_labels)
+  ) +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_minimal(base_size = 10) +
+  labs(
+    title = "",
+    x = "Final Measurement Value",
+    y = " "
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_blank(),      # remove y labels
+    axis.ticks.y = element_blank(),     # remove y ticks
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    strip.text = element_text(size = 10, face = "bold"),
+    plot.title = element_text(size = 10),
+    aspect.ratio = 0.6,
+    panel.spacing = unit(0.3, "lines"),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+  ) + scale_x_continuous(n.breaks = 4, limits = c(500, NA))
+
+
+
+```
+
+
+### functions
+```{r}
+
+setwd("C:/Users/SamZalewski/Documents/TFM")
+
+
+add_noise_1d_h <- function(sim_data, R_scaled, h_label) {
+  px <- sim_data$px
+  n <- length(px)
+
+  h1 <- Vectorize(function(x) x[1])
+  h2 <- Vectorize(function(x) atan((x[1] + 300) / 10000))
+  h3 <- Vectorize(function(x) sign(x[1] + 70) * abs(x[1] + 70)^3 * 20)
+  h4 <- Vectorize(function(x) (x[1] + 50)^4)
+  h5 <- Vectorize(function(x) sign(x[1]) * abs(x[1] )^6 * 0.0001)  # Updated h5
+
+  forward_funcs <- list(h1 = h1, h2 = h2, h3 = h3, h4 = h4, h5 = h5)
+  h <- forward_funcs[[h_label]]
+
+  true_measurements <- h(as.data.frame(t(px)))
+  ref_val <- h(1000)
+  sd <- R_scaled * abs(ref_val)  # scale by magnitude of reference measurement
+
+  noisy_measurements <- true_measurements + rnorm(n, mean = 0, sd = sd)
+  sim_data$px_noisy <- noisy_measurements
+
+  return(sim_data)
+}
+
+
+
+  source("UKF_all_groundup_newweights.R")
+
+run_UKF_1D <- function(sim_data, alpha = 1, beta = 0, kappa = 2, Q, R, x0, h) {
+  library(numDeriv)
+
+  dt <- 1
+  
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],  # x position
+      x[2] + dt * x[3],                      # x velocity
+      x[3]                                   # x acceleration
+    )
+  }
+  
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2,
+      dt,
+      1
+    ), nrow = 3, ncol = 1)
+  }
+
+  y <- matrix(sim_data$px_noisy, nrow = 1)
+
+  P0 <- diag(rep(1, 3))
+  h <- h
+
+  result <- unscentedkalmanf_all_newweights(y, f, B, Q, h, R, x0, P0, alpha, beta, kappa)
+
+  list(px = result$x.f[1, ])  # output filtered x position
+}
+
+  source("EKF_1Dstable.R")
+
+run_EKF_1D <- function(sim_data, Q, R, x0, h) {
+  dt <- 1
+  library(numDeriv)
+
+
+  f <- function(x) {
+    c(
+      x[1] + x[2] * dt + 0.5 * dt^2 * x[3],  # position
+      x[2] + dt * x[3],                      # velocity
+      x[3]                                   # acceleration
+    )
+  }
+
+  
+  B <- function(x) {
+    matrix(c(
+      (dt^2)/2,
+      dt,
+      1
+    ), nrow = 3, ncol = 1)
+  }
+
+  y <- matrix(sim_data$px_noisy, nrow = 1)
+
+  P0 <- diag(rep(1, 3))
+
+  result <- extendedkalmanf_1dstable(y, f, B, Q, h, R, x0, P0)
+
+  list(px = result$x.f[1, ])
+}
+
+
+```
+
+### demo path
+
+```{r}
+
+
+
+library(ggplot2)
+library(dplyr)
+
+dt <- 1
+
+n_steps <- 60
+ 
+x0 <- c(1000, 2, 0)
+
+
+h1 <- function(x) x[1]
+h2 <- function(x) atan((x[1] + 300) / 10000)
+h3 <- function(x) sign(x[1] + 70) * abs(x[1] + 70)^3 * 20
+h4 <- function(x) (x[1] + 50)^4   
+h5 <- function(x) sign(x[1] ) * abs(x[1] )^6 * 0.0001   
+
+h1_inv <- function(y) y
+h2_inv <- function(y) tan(y) * 10000 - 300 
+h3_inv <- function(y) sign(y) * abs(y / 20)^(1 / 3) - 70
+h4_inv <- function(y) sign(y) * abs(y)^(1/4) - 50
+h5_inv <- function(y) sign(y) * abs((y ) / 0.0001)^(1/6) 
+
+
+measurement_funcs <- list(
+  h1 = h1,
+  h2 = h2,
+  h3 = h3,
+  h4 = h4,
+  h5 = h5
+)
+
+
+h_label <- "h5" 
+h <- measurement_funcs[[h_label]]
+
+
+
+#R_prop_values <- c(0.005, 0.03)
+#sigma_a_values <- c(0.005, 0.1 )
+
+
+R_prop <- 0.01 * 7
+sigma_a <- 0.01
+
+q <- sigma_a^2
+
+
+x0 <- c(1000, 2, 0)
+Q <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+ref_val <- h(1000)
+
+
+R_scaled <- R_prop 
+
+
+
+sim_data <- simulate_flight_1D(x0, n_steps, Q)
+sim_data_noisy <- add_noise_1d_h(sim_data, R_scaled, h_label = h_label)
+
+
+result <- run_UKF_1D(
+  sim_data = sim_data_noisy,
+  alpha = 0.0001,
+  beta = 2,
+  kappa = 0,
+  Q = Q*10,
+  R = (R_prop * ref_val)^2,
+  x0 = x0,
+  h = h
+)
+
+result <- run_EKF_1D( sim_data = sim_data_noisy,Q = Q*1, R= 10000* (R_prop * ref_val)^2,x0 = x0,h = h)
+
+inverse_funcs <- list(h1 = h1_inv, h2 = h2_inv, h3 = h3_inv, h4 = h4_inv, h5=h5_inv )
+
+h_inv <- inverse_funcs[[h_label]]
+
+measured_state_space <- h_inv(sim_data_noisy$px_noisy)
+
+filtered_transformed <- sapply(1:length(result$px), function(i) h(c(result$px[i], NA, NA)))
+
+
+plot_df <- data.frame(
+  Time = sim_data$time,
+  True_X = sim_data$px,
+  Filtered_X = result$px,
+  Measured_X = measured_state_space 
+)
+
+rmse <- sqrt(mean((plot_df$Filtered_X - plot_df$True_X)^2))
+
+
+ggplot() +
+  geom_path(data = plot_df, aes(x = Time, y = True_X, color = "True Trajectory"), linetype = "dotted", size = 1) +
+  geom_path(data = plot_df, aes(x = Time, y = Filtered_X, color = "Filtered Trajectory"), size = 1) +
+  geom_point(data = plot_df, aes(x = Time, y = Measured_X, color = "Measurements"), shape = 4, size = 2) +
+  labs(
+    title = paste("1D UKF with", h_label, "Measurement Function\nRMSE =", round(rmse, 3)),
+    x = "Time",
+    y = "X Position",
+    color = "Legend"
+  ) +
+  scale_color_manual(values = c(
+    "True Trajectory" = "black",
+    "Filtered Trajectory" = "blue",
+    "Measurements" = "red"
+  )) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+
+```
+
+#### demo both
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+
+dt <- 1
+
+n_steps <- 40
+ 
+x0 <- c(1000, 2, 0)
+
+
+h1 <- function(x) x[1]
+h2 <- function(x) atan((x[1] + 300) / 10000)
+h3 <- function(x) sign(x[1] + 70) * abs(x[1] + 70)^3 * 20
+h4 <- function(x) (x[1] + 50)^4   
+h5 <- function(x) sign(x[1] ) * abs(x[1] )^6 * 0.0001   
+
+h1_inv <- function(y) y
+h2_inv <- function(y) tan(y) * 10000 - 300 
+h3_inv <- function(y) sign(y) * abs(y / 20)^(1 / 3) - 70
+h4_inv <- function(y) sign(y) * abs(y)^(1/4) - 50
+h5_inv <- function(y) sign(y) * abs((y ) / 0.0001)^(1/6) 
+
+
+
+h_label <- "h1" 
+h <- measurement_funcs[[h_label]]
+
+
+#R_prop_values <- c(0.01, 0.1)
+#sigma_a_values <- c(0.005, 0.1 )
+ ref_val <- h(c(1000, 0, 0))
+
+
+R_prop <- 0.01 * 7.1
+sigma_a <- 0.005
+
+q <- sigma_a^2
+
+
+x0 <- c(1000, 2, 0)
+Q <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+
+
+R_scaled <- R_prop 
+
+#set.seed(12)
+sim_data <- simulate_flight_1D(x0, n_steps, Q)
+sim_data_noisy <- add_noise_1d_h(sim_data, R_scaled, h_label = h_label)
+
+
+# Run UKF
+ukf_result <- run_UKF_1D(
+  sim_data = sim_data_noisy,
+  alpha = 0.0001,
+  beta = 2,
+  kappa = 0,
+  Q = Q * 1623.77674,
+  R = 500*(R_prop * abs(ref_val))^2,
+  x0 = x0,
+  h = h
+)
+
+# Run EKF
+ekf_result <- run_EKF_1D(
+  sim_data = sim_data_noisy,
+  Q = 885.866790 * Q,
+  R = 10000.000 * (R_prop * ref_val)^2,
+  x0 = x0,
+  h = h
+)
+
+# Inverse transform measurements back to state space
+measured_state_space <- h_inv(sim_data_noisy$px_noisy)
+
+# Compute RMSEs
+ukf_rmse <- sqrt(mean((ukf_result$px - sim_data$px)^2))
+ekf_rmse <- sqrt(mean((ekf_result$px - sim_data$px)^2))
+
+# Long-format data for ggplot
+plot_df <- bind_rows(
+  data.frame(Time = sim_data$time, X = sim_data$px, Type = "True Trajectory", Filter = "EKF"),
+  data.frame(Time = sim_data$time, X = measured_state_space, Type = "Measurements", Filter = "EKF"),
+  data.frame(Time = sim_data$time, X = ekf_result$px, Type = "Filtered Trajectory", Filter = "EKF"),
+  
+  data.frame(Time = sim_data$time, X = sim_data$px, Type = "True Trajectory", Filter = "UKF"),
+  data.frame(Time = sim_data$time, X = measured_state_space, Type = "Measurements", Filter = "UKF"),
+  data.frame(Time = sim_data$time, X = ukf_result$px, Type = "Filtered Trajectory", Filter = "UKF")
+)
+
+# Plot
+ggplot(plot_df, aes(x = Time, y = X, color = Type)) +
+  geom_line(data = subset(plot_df, Type != "Measurements"), size=1) +
+    geom_point(data = subset(plot_df, Type == "Measurements"), size = 2, alpha = 0.6) +
+  facet_wrap(~Filter) +
+  labs(
+    title = paste("EKF vs UKF with", h_label, "\nUKF RMSE =", round(ukf_rmse, 3), "| EKF RMSE =", round(ekf_rmse, 3)),
+    x = "Time",
+    y = "X Position",
+    color = "Legend"
+  ) +
+  scale_color_manual(values = c(
+    "True Trajectory" = "black",
+    "Filtered Trajectory" = "blue"
+  )) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+```
+
+
+
+## grid search
+
+
+```{r}
+
+
+
+h_labels <- c("h1", "h2", "h3", "h4" ) 
+
+results_all <- data.frame()
+results_summary <- data.frame()
+
+betas <- c(0,1,2,3,4,5,6,7,8,9,10)
+n_reps <- 100
+n_steps <- 40
+sigma_a <- 0.03
+q <- sigma_a^2
+dt <- 1
+x0 <- c(1000, 2, 0)
+
+Q_base <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+for (h_label in h_labels) {
+  cat("\n--- Measurement Function:", h_label, "---\n")
+
+  h     <- measurement_funcs[[h_label]]
+  h_inv <- inverse_funcs[[h_label]]
+  ref_val <- h(c(1000, NA, NA))
+
+  for (rep in seq_len(n_reps)) {
+    cat("Rep", rep, "/", n_reps, " | h:", h_label, "\n")
+
+    R_prop <- 0.3
+    R_val  <- (R_prop * ref_val)^2
+    R_mat  <- matrix(R_val, 1, 1)
+    
+    sim_data <- simulate_flight_1D(x0, n_steps, Q_base)
+    sim_data_noisy <- add_noise_1d_h(sim_data, R_scaled = R_prop, h_label = h_label)
+
+    # --- EKF (once per rep)
+    ekf_result <- run_EKF_1D(sim_data_noisy, Q = Q_base * 100, R = R_mat, x0 = x0, h = h)
+    ekf_rmse <- mean((ekf_result$px - sim_data$px)^2)
+
+    results_all <- rbind(results_all, data.frame(
+      h_label = h_label,
+      filter = "EKF",
+      beta = NA,
+      rep = rep,
+      RMSE = ekf_rmse
+    ))
+
+    results_summary <- rbind(results_summary, data.frame(
+      h_label = h_label,
+      filter = "EKF",
+      beta = NA,
+      mean_RMSE = ekf_rmse  # this will be averaged later if needed
+    ))
+
+
+      for (beta_j in betas) {
+      ukf_result <- run_UKF_1D(
+        sim_data = sim_data_noisy,
+        alpha = 0.00001,
+        beta = beta_j,
+        kappa = 3,
+        Q = Q_base,
+        R = R_mat,
+        x0 = x0,
+        h = h
+      )
+
+      ukf_rmse <- mean((ukf_result$px - sim_data$px)^2)
+
+      results_all <- rbind(results_all, data.frame(
+        h_label = h_label,
+        filter = "UKF",
+        beta = beta_j,
+        rep = rep,
+        RMSE = ukf_rmse
+      ))
+
+      results_summary <- rbind(results_summary, data.frame(
+        h_label = h_label,
+        filter = "UKF",
+        beta = beta_j,
+        mean_RMSE = ukf_rmse  # will be aggregated later
+      ))
+    }
+  }
+}
+
+
+results_summary_final <- results_summary %>%
+  group_by(h_label, filter, beta) %>%
+  summarise(mean_RMSE = mean(mean_RMSE, na.rm = TRUE), .groups = "drop")
+
+
+```
+
+### graph grid
+
+```{r}
+
+
+library(dplyr)
+library(ggplot2)
+
+ukf_avg_rmse <- results_all %>%
+  filter(filter == "UKF") %>%
+  group_by(h_label, beta) %>%
+  summarise(mean_RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop")
+
+ggplot(ukf_avg_rmse, aes(x = factor(beta), y = mean_RMSE)) +
+  geom_line(aes(group = 1)) +
+  geom_point() +
+  facet_wrap(~ h_label, scales = "free_y") +
+  labs(
+    title = "Average RMSE vs Beta for UKF",
+    x = expression(beta),
+    y = "Average RMSE"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+```{r}
+library(dplyr)
+
+ukf_avg_rmse_table <- results_all %>%
+  filter(filter == "UKF") %>%
+  group_by(h_label, beta) %>%
+  summarise(mean_RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop")
+
+# View in console
+print(ukf_avg_rmse_table)
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+results_all$beta <- as.factor(results_all$beta)
+
+unique_h_labels <- unique(results_all$h_label)
+
+for (h in unique_h_labels) {
+  plot_data <- results_all %>% filter(h_label == h)
+
+  p <- ggplot(plot_data, aes(x = R_scale, y = RMSE, color = beta, group = beta)) +
+    stat_summary(fun = mean, geom = "line", size = 1) +
+    stat_summary(fun = mean, geom = "point", size = 2) +
+    labs(
+      title = paste("Raw RMSE by Beta —", h),
+      x = "R_scale",
+      y = "RMSE",
+      color = expression(beta)
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      legend.position = "right"
+    )
+
+  print(p)
+}
+
+```
+```{r}
+summary_table <- results_all %>%
+  group_by(h_label, beta, R_scale) %>%
+  summarise(
+    mean_RMSE = mean(RMSE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(h_label, R_scale, beta)
+
+print(summary_table)
+
+```
+
+
+#optimal Qs
+
+```{r}
+
+
+optimize_Q_multiplier <- function(
+  h_label, R_prop, sigma_a,
+  Q_mult_grid = 10^seq(1, 24, length.out = 20), #originally 3.5
+  n_steps = 40, n_reps = 100
+  
+) {
+  cat("Optimizing Q for", h_label, "- R_prop:", R_prop, "- sigma_a:", sigma_a, "\n")
+
+  # --- R multipliers (like your other loop)
+ # Set pre-optimized R multipliers based on sigma_a, R_prop, and h_label
+  R_mult_ekf <- 1
+  R_mult_ukf <- 1
+  
+  
+  if (sigma_a == 0.005 && R_prop == 0.01) {
+  
+    if (h_label == "h1") { R_mult_ekf <- 2424.462;  R_mult_ukf <- 11.93777 }
+    if (h_label == "h2") { R_mult_ekf <- 1701.254;  R_mult_ukf <- 34.55107 }
+    if (h_label == "h3") { R_mult_ekf <- 10000.000;  R_mult_ukf <- 24.24462 }
+    if (h_label == "h4") { R_mult_ekf <- 2424.462; R_mult_ukf <- 24.24462 }
+    if (h_label == "h5") { R_mult_ekf <- 3455.107;  R_mult_ukf <- 11.93777 }
+
+  } else if (sigma_a == 0.005 && R_prop == 0.1) {
+    if (h_label == "h1") { R_mult_ekf <- 3792.690;  R_mult_ukf <- 500 }
+    if (h_label == "h2") { R_mult_ekf <- 6158.482; R_mult_ukf <- 500 }
+    if (h_label == "h3") { R_mult_ekf <- 3792.690;  R_mult_ukf <- 500 }
+    if (h_label == "h4") { R_mult_ekf <- 6158.482;  R_mult_ukf <- 500 }
+    if (h_label == "h5") { R_mult_ekf <- 10000.000;  R_mult_ukf <- 500 }
+    
+  } else if (sigma_a == 0.1 && R_prop == 0.01) {
+    if (h_label == "h1") { R_mult_ekf <- 44.06236;    R_mult_ukf <- 2.9763514 }
+    if (h_label == "h2") { R_mult_ekf <- 37.69391;    R_mult_ukf <- 2.9763514 }
+    if (h_label == "h3") { R_mult_ekf <- 53.83125;    R_mult_ukf <- 1.963828 }
+    if (h_label == "h4") { R_mult_ekf <- 69.95642;    R_mult_ukf <- 1.429461 }
+    if (h_label == "h5") { R_mult_ekf <- 53.83125;    R_mult_ukf <- 1.429461 }
+    
+  } else if (sigma_a == 0.1 && R_prop == 0.1) {
+    if (h_label == "h1") { R_mult_ekf <- 7.333413;    R_mult_ukf <- 0.9275705 }
+    if (h_label == "h2") { R_mult_ekf <- 10.000000;    R_mult_ukf <- 0.7943282 }
+    if (h_label == "h3") { R_mult_ekf <- 10.000000;    R_mult_ukf <- 0.8808419 }
+    if (h_label == "h4") { R_mult_ekf <- 7.722450;    R_mult_ukf <- 0.8808419 }
+    if (h_label == "h5") { R_mult_ekf <- 10.000000;    R_mult_ukf <- 1.0831632 }
+  }
+
+
+  # --- Setup
+  h_multipliers <- c(h1 = 1, h2 = 0.763964, h3 = 3.003604, h4 = 4.232432, h5 = 7.145946)
+  R_prop_scaled <- R_prop * h_multipliers[[h_label]]
+  q <- sigma_a^2
+  x0 <- c(1000, 2, 0)
+  h <- measurement_funcs[[h_label]]
+  h_inv <- inverse_funcs[[h_label]]
+  ref_val <- h(1000)
+  R_val <- (R_prop_scaled * ref_val)^2
+  R_mat_base <- matrix(R_val, 1, 1)
+
+  base_Q <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) * q
+
+  results <- data.frame(
+    Q_mult = Q_mult_grid,
+    RMSE_EKF = NA_real_,
+    RMSE_UKF = NA_real_
+  )
+
+  for (j in seq_along(Q_mult_grid)) {
+    Q_mult <- Q_mult_grid[j]
+    rmse_ekf <- numeric(n_reps)
+    rmse_ukf <- numeric(n_reps)
+
+    for (i in seq_len(n_reps)) {
+      sim_data <- simulate_flight_1D(x0, n_steps, base_Q)
+      sim_data_noisy <- add_noise_1d_h(sim_data, R_scaled = R_prop_scaled, h_label = h_label)
+
+      ekf_result <- run_EKF_1D(
+        sim_data_noisy,
+        Q = base_Q * Q_mult,
+        R = R_mat_base * R_mult_ekf,
+        x0 = x0,
+        h = h
+      )
+
+      ukf_result <- run_UKF_1D(
+        sim_data_noisy,
+        Q = base_Q * Q_mult,
+        R = R_mat_base * R_mult_ukf,
+        alpha = alpha_fixed,
+        beta = beta_fixed,
+        kappa = kappa_fixed,
+        x0 = x0,
+        h = h
+      )
+
+      rmse_ekf[i] <- mean((ekf_result$px - sim_data$px)^2)
+      rmse_ukf[i] <- mean((ukf_result$px - sim_data$px)^2)
+    }
+
+    results$RMSE_EKF[j] <- sqrt(mean(rmse_ekf))
+    results$RMSE_UKF[j] <- sqrt(mean(rmse_ukf))
+  }
+
+  best_ekf <- results$Q_mult[which.min(results$RMSE_EKF)]
+  best_ukf <- results$Q_mult[which.min(results$RMSE_UKF)]
+
+  return(list(
+    results_df = results,
+    best_ekf_Q = best_ekf,
+    best_ukf_Q = best_ukf
+  ))
+}
+
+
+# Run all combinations
+scenarios <- expand.grid(
+  h_label = c("h1", "h2", "h3", "h4", "h5"),
+  #h_label = c("h1", "h2"),
+  #R_prop = c(0.01, 0.1,
+  #sigma_a = c(0.005, 0.1),
+  R_prop = c(0.01),
+  sigma_a = c(0.1),
+  stringsAsFactors = FALSE
+)
+
+
+summary_df <- data.frame()
+
+for (i in 1:nrow(scenarios)) {
+  s <- scenarios[i, ]
+  h_label <- s$h_label
+  R_prop <- s$R_prop
+  sigma_a <- s$sigma_a
+
+  res <- optimize_Q_multiplier(h_label, R_prop, sigma_a)
+
+  summary_df <- rbind(summary_df, data.frame(
+    h_label = h_label,
+    R_prop = R_prop,
+    sigma_a = sigma_a,
+    best_Q_EKF = res$best_ekf_Q,
+    best_Q_UKF = res$best_ukf_Q
+  ))
+}
+
+# Output results
+print(summary_df)
+
+
+
+
+
+```
+
+
+# optimal h R_mult
+```{r}
+
+
+
+calibrate_R_multipliers_simulated <- function(
+  R_mult_grid = seq(0.1, 10, length.out = 1000),
+  n_steps = 40,
+  n_reps = 1000,
+  x0 = c(1000, 2, 0),
+  sigma_a = 0.01,
+  dt = 1
+) {
+  # Define forward and inverse measurement functions
+  h1 <- function(x) x[1]
+  h2 <- function(x) atan((x[1] + 300) / 10000)
+  h3 <- function(x) sign(x[1] + 70) * abs(x[1] + 70)^3 * 20
+  h4 <- function(x) (x[1] + 50)^4   
+  h5 <- function(x) sign(x[1]) * abs(x[1])^6 * 0.0001
+
+  h1_inv <- function(y) y
+  h2_inv <- function(y) tan(y) * 10000 - 300 
+  h3_inv <- function(y) sign(y) * abs(y / 20)^(1 / 3) - 70
+  h4_inv <- function(y) sign(y) * abs(y)^(1/4) - 50
+  h5_inv <- function(y) sign(y) * abs(y / 0.0001)^(1/6)
+
+  forward_funcs <- list(h2 = h2, h3 = h3, h4 = h4, h5 = h5)  # exclude h1
+  inverse_funcs <- list(h2 = h2_inv, h3 = h3_inv, h4 = h4_inv, h5 = h5_inv)
+
+  # Reference Q matrix
+  q <- sigma_a^2
+  base_Q <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) * q
+
+  # Storage
+  results <- data.frame(
+    h_label = character(),
+    R_mult = numeric(),
+    sd_error = numeric(),
+    sd_err_h1 = numeric(),
+    std_dif = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  # Precompute baseline error std for h1
+  sim_data_list <- lapply(1:n_reps, function(i) simulate_flight_1D(x0, n_steps, base_Q))
+  total_errors_h1 <- unlist(lapply(sim_data_list, function(sim_data) {
+    noisy <- add_noise_1d_h(sim_data, R_scaled = 0.01, h_label = "h1")
+    recovered <- h1_inv(noisy$px_noisy)
+    recovered - sim_data$px
+  }))
+  sd_err_h1 <- sd(total_errors_h1)
+
+  # Loop through h2–h5
+  for (h_label in names(forward_funcs)) {
+    cat("Calibrating for", h_label, "\n")
+
+    h_inv <- inverse_funcs[[h_label]]
+
+    for (R_mult in R_mult_grid) {
+      total_errors <- unlist(lapply(sim_data_list, function(sim_data) {
+        noisy <- add_noise_1d_h(sim_data, R_scaled = 0.01 * R_mult, h_label = h_label)
+        recovered <- h_inv(noisy$px_noisy)
+        recovered - sim_data$px
+      }))
+
+      sd_err <- sd(total_errors)
+      std_dif <- abs(sd_err_h1 - sd_err)
+
+      results <- rbind(results, data.frame(
+        h_label = h_label,
+        R_mult = R_mult,
+        sd_error = sd_err,
+        sd_err_h1 = sd_err_h1,
+        std_dif = std_dif
+      ))
+    }
+  }
+
+  return(results)
+}
+
+
+
+sim_results <- calibrate_R_multipliers_simulated()
+
+
+```
+
+
+# optimal R_mult
+
+
+
+```{r}
+
+
+
+optimize_R_multiplier <- function(
+  h_label, R_prop, sigma_a,
+  R_mult_grid = 10^seq(-0.8, 0.8, length.out = 40), #used to be 5
+  n_steps = 40, n_reps = 120
+) {
+  cat("Optimizing R_mult for", h_label, "- R_prop:", R_prop, "- sigma_a:", sigma_a, "\n")
+
+  # Scaling constants
+  h_multipliers <- c(h1 = 1, h2 = 0.763964, h3 = 3.003604, h4 = 4.232432, h5 = 7.145946)
+  R_prop_scaled <- R_prop * h_multipliers[[h_label]]
+
+  # Set pre-optimized Q multipliers
+  # Set pre-optimized Q multipliers based on sigma_a, R_prop, and h_label
+q_mult <- 1
+q_mult_ekf <- 1
+
+if (sigma_a == 0.005 && R_prop == 0.01) {
+  if (h_label == "h1") { q_mult_ekf <- 1.623777; q_mult <- 5455.595 }
+  if (h_label == "h2") { q_mult_ekf <- 29.763514; q_mult <- 10000.000 }
+  if (h_label == "h3") { q_mult_ekf <- 78.475997; q_mult <- 4832.930 }
+  if (h_label == "h4") { q_mult_ekf <- 335.981829; q_mult <- 10000.000 }
+  if (h_label == "h5") { q_mult_ekf <- 885.866790; q_mult <- 3359.818 }
+  
+} else if (sigma_a == 0.005 && R_prop == 0.1) {
+  if (h_label == "h1") { q_mult_ekf <- 78.475997; q_mult <- 143.84499 }
+  if (h_label == "h2") { q_mult_ekf <- 42.813324; q_mult <- 42.81332 }
+  if (h_label == "h3") { q_mult_ekf <- 1.128838; q_mult <- 143.84499 }
+  if (h_label == "h4") { q_mult_ekf <- 3.792690; q_mult <- 885.86679 }
+  if (h_label == "h5") { q_mult_ekf <- 885.866790; q_mult <- 1623.77674 }
+} else if (sigma_a == 0.1 && R_prop == 0.01) {
+  if (h_label == "h1") { q_mult_ekf <- 29.28645; q_mult <- 146.7799 }
+  if (h_label == "h2") { q_mult_ekf <- 29.28645; q_mult <- 146.7799 }
+  if (h_label == "h3") { q_mult_ekf <- 74.43803; q_mult <- 66.10354 }
+  if (h_label == "h4") { q_mult_ekf <- 49.23883; q_mult <- 60.38080 }
+  if (h_label == "h5") { q_mult_ekf <- 46.41589; q_mult <- 60.38080 }
+  
+} else if (sigma_a == 0.1 && R_prop == 0.1) {
+  if (h_label == "h1") { q_mult_ekf <- 1.1622676; q_mult <- 142.70211 }
+  if (h_label == "h2") { q_mult_ekf <- 0.7614347; q_mult <- 136.20003 }
+  if (h_label == "h3") { q_mult_ekf <- 0.1184321; q_mult <- 144.37556 }
+  if (h_label == "h4") { q_mult_ekf <- 0.6996776; q_mult <- 156.65228 }
+  if (h_label == "h5") { q_mult_ekf <- 0.9813789; q_mult <- 92.70189 }
+}
+
+
+  # Measurement and dynamics setup
+  q <- sigma_a^2
+  x0 <- c(1000, 2, 0)
+  h <- measurement_funcs[[h_label]]
+  h_inv <- inverse_funcs[[h_label]]
+  ref_val <- h(1000)
+  R_val <- (R_prop_scaled * ref_val)^2
+  base_Q <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) * q
+
+  # Store results
+  results <- data.frame(
+    R_mult = R_mult_grid,
+    RMSE_EKF = NA_real_,
+    RMSE_UKF = NA_real_
+  )
+
+  # Grid search over R_mult
+  for (j in seq_along(R_mult_grid)) {
+    R_mult <- R_mult_grid[j]
+    rmse_ekf <- numeric(n_reps)
+    rmse_ukf <- numeric(n_reps)
+
+    for (i in seq_len(n_reps)) {
+      sim_data <- simulate_flight_1D(x0, n_steps, base_Q)
+      sim_data_noisy <- add_noise_1d_h(sim_data, R_scaled = R_prop_scaled, h_label = h_label)
+
+      R_mat <- matrix(R_val * R_mult, 1, 1)
+
+      ekf_result <- run_EKF_1D(sim_data_noisy, Q = base_Q * q_mult_ekf, R = R_mat, x0 = x0, h = h)
+      ukf_result <- run_UKF_1D(sim_data_noisy, Q = base_Q * q_mult, R = R_mat,
+                               alpha = alpha_fixed, beta = beta_fixed, kappa = kappa_fixed,
+                               x0 = x0, h = h)
+
+      rmse_ekf[i] <- mean((ekf_result$px - sim_data$px)^2)
+      rmse_ukf[i] <- mean((ukf_result$px - sim_data$px)^2)
+    }
+
+    results$RMSE_EKF[j] <- sqrt(mean(rmse_ekf))
+    results$RMSE_UKF[j] <- sqrt(mean(rmse_ukf))
+  }
+
+  best_ekf <- results$R_mult[which.min(results$RMSE_EKF)]
+  best_ukf <- results$R_mult[which.min(results$RMSE_UKF)]
+
+  return(list(
+    results_df = results,
+    best_R_EKF = best_ekf,
+    best_R_UKF = best_ukf
+  ))
+}
+
+
+# Define search grid
+scenarios <- expand.grid(
+  h_label = c("h1", "h2", "h3", "h4", "h5"),
+  #h_label = c("h1", "h2"),
+  #R_prop = c(0.01, 0.1),
+  #sigma_a = c(0.005, 0.1),
+  R_prop = c(0.01),
+  sigma_a = c(0.1),
+  stringsAsFactors = FALSE
+)
+
+summary_df <- data.frame()
+
+for (i in 1:nrow(scenarios)) {
+  s <- scenarios[i, ]
+  res <- optimize_R_multiplier(s$h_label, s$R_prop, s$sigma_a)
+  summary_df <- rbind(summary_df, data.frame(
+    h_label = s$h_label,
+    R_prop = s$R_prop,
+    sigma_a = s$sigma_a,
+    best_R_EKF = res$best_R_EKF,
+    best_R_UKF = res$best_R_UKF
+  ))
+}
+
+print(summary_df)
+
+
+
+```
+
+
+
+
+```{r}
+
+# Run the function
+
+# Summarize: find R_mult with lowest sd_error per h_label
+summary_R_mults <- sim_results %>%
+  dplyr::group_by(h_label) %>%
+  dplyr::slice_min(std_dif, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+# View summary
+print(summary_R_mults)
+
+```
+
+```{r}
+# Define search grid
+scenarios <- expand.grid(
+  h_label = c("h1", "h2", "h3", "h4", "h5"),
+  R_prop = c(0.005, 0.01),
+  sigma_a = c(0.005, 0.1),
+  stringsAsFactors = FALSE
+)
+
+summary_df <- data.frame()
+
+for (i in 1:nrow(scenarios)) {
+  s <- scenarios[i, ]
+  res <- optimize_R_multiplier(s$h_label, s$R_prop, s$sigma_a)
+  summary_df <- rbind(summary_df, data.frame(
+    h_label = s$h_label,
+    R_prop = s$R_prop,
+    sigma_a = s$sigma_a,
+    best_R_EKF = res$best_R_EKF,
+    best_R_UKF = res$best_R_UKF
+  ))
+}
+
+print(summary_df)
+
+```
+
+
+
+
+
+# Measurement Functions: EKF vs UKF
+
+```{r}
+
+h1 <- function(x) x[1]
+h2 <- function(x) atan((x[1] + 300) / 10000)
+h3 <- function(x) sign(x[1] + 70) * abs(x[1] + 70)^3 * 20
+h4 <- function(x) (x[1] + 50)^4   
+h5 <- function(x) sign(x[1] ) * abs(x[1] )^6 * 0.0001   
+
+h1_inv <- function(y) y
+h2_inv <- function(y) tan(y) * 10000 - 300 
+h3_inv <- function(y) sign(y) * abs(y / 20)^(1 / 3) - 70
+h4_inv <- function(y) sign(y) * abs(y)^(1/4) - 50
+h5_inv <- function(y) sign(y ) * abs((y ) / 0.0001)^(1/6) 
+
+measurement_funcs <- list(
+  h1 = h1, h2 = h2, h3 = h3, h4 = h4, h5 = h5
+)
+inverse_funcs <- list(
+  h1 = h1_inv, h2 = h2_inv, h3 = h3_inv, h4 = h4_inv, h5 = h5_inv
+)
+
+h_labels <- c("h1", "h2", "h3", "h4", "h5")
+results_comparison_grid <- data.frame()
+
+# Grid search parameters
+
+#R_prop_values <- c(0.005, 0.01)
+#sigma_a_values <- c(0.005, 0.1 )
+
+R_prop_values <- c(0.01, 0.1)
+sigma_a_values <- c(0.005, 0.1 )
+
+set.seed(123)
+n_reps <- 5000
+n_steps <- 40
+dt <- 1
+x0 <- c(1000, 2, 0)
+
+alpha_fixed <- 0.0001
+beta_fixed <- 2  
+kappa_fixed <- 0
+
+evaluate_h_function_grid <- function(h_label, R_prop, sigma_a, n_reps = 100) {
+  cat("Evaluating", h_label, "- R_prop:", R_prop, "- sigma_a:", sigma_a, "\n")
+
+  # Adjust R_prop per h function
+  h_multipliers <- c(h1 = 1, h2 = 0.763964, h3 = 3.003604, h4 = 4.232432, h5 = 7.145946)
+    h_multipliers <- c(h1 = 1, h2 = 1, h3 = 1, h4 = 1, h5 = 1)
+
+  R_prop_scaled <- R_prop * h_multipliers[[h_label]]
+
+  # Build Q base matrix
+  q <- sigma_a^2
+  Q_base <- matrix(c(
+    (dt^4)/4, (dt^3)/2, (dt^2)/2,
+    (dt^3)/2, dt^2,     dt,
+    (dt^2)/2, dt,       1
+  ), nrow = 3, byrow = TRUE) * q
+
+  # Select measurement functions
+  h     <- measurement_funcs[[h_label]]
+  h_inv <- inverse_funcs[[h_label]]
+  ref_val <- h(c(1000, 0, 0))
+
+  R_val <- (R_prop_scaled * abs(ref_val))^2
+  R_mat <- matrix(R_val, 1, 1)
+
+  # --- Tuned Q multipliers (from prior optimization)
+q_mult <- 1
+q_mult_ekf <- 1
+
+
+  # --- Q multiplier tuning
+
+if (sigma_a == 0.005 && R_prop == 0.01) {
+  if (h_label == "h1") { q_mult <- 5455.595; q_mult_ekf <- 1.623777 }
+  if (h_label == "h2") { q_mult <- 10000.000; q_mult_ekf <- 29.763514 }
+  if (h_label == "h3") { q_mult <- 10000.000; q_mult_ekf <- 78.475997 }
+  if (h_label == "h4") { q_mult <- 10000.000; q_mult_ekf <- 335.981829 }
+  if (h_label == "h5") { q_mult <- 3359.818; q_mult_ekf <- 885.866790 }
+  
+} else if (sigma_a == 0.005 && R_prop == 0.1) {
+  if (h_label == "h1") { q_mult_ekf <- 78.475997; q_mult <- 143.84499 }
+  if (h_label == "h2") { q_mult_ekf <- 42.813324; q_mult <- 42.81332 }
+  if (h_label == "h3") { q_mult_ekf <- 1.128838; q_mult <- 143.84499 }
+  if (h_label == "h4") { q_mult_ekf <- 3.792690; q_mult <- 885.86679 }
+  if (h_label == "h5") { q_mult_ekf <- 885.866790; q_mult <- 1623.77674 }
+
+} else if (sigma_a == 0.1 && R_prop == 0.01) {
+  if (h_label == "h1") { q_mult_ekf <- 29.28645; q_mult <- 146.7799 }
+  if (h_label == "h2") { q_mult_ekf <- 29.28645; q_mult <- 146.7799 }
+  if (h_label == "h3") { q_mult_ekf <- 74.43803; q_mult <- 66.10354 }
+  if (h_label == "h4") { q_mult_ekf <- 49.23883; q_mult <- 60.38080 }
+  if (h_label == "h5") { q_mult_ekf <- 46.41589; q_mult <- 60.38080 }
+    
+} else if (sigma_a == 0.1 && R_prop == 0.1) {
+  if (h_label == "h1") { q_mult_ekf <- 1.1622676; q_mult <- 142.70211 }
+  if (h_label == "h2") { q_mult_ekf <- 0.7614347; q_mult <- 136.20003 }
+  if (h_label == "h3") { q_mult_ekf <- 0.1184321; q_mult <- 144.37556 }
+  if (h_label == "h4") { q_mult_ekf <- 0.6996776; q_mult <- 156.65228 }
+  if (h_label == "h5") { q_mult_ekf <- 0.9813789; q_mult <- 92.70189 }
+}
+
+  # --- R multiplier tuning
+ if (sigma_a == 0.005 && R_prop == 0.01) {
+    if (h_label == "h1") { R_mult_ekf <- 6951.92796;  R_mult_ukf <- 20.69138 }
+    if (h_label == "h2") { R_mult_ekf <- 4832.93024;  R_mult_ukf <- 14.38450 }
+    if (h_label == "h3") { R_mult_ekf <- 6951.92796;  R_mult_ukf <- 14.38450 }
+    if (h_label == "h4") { R_mult_ekf <- 10000.00000; R_mult_ukf <- 14.38450 }
+    if (h_label == "h5") { R_mult_ekf <- 6951.92796;  R_mult_ukf <- 29.76351 }
+  
+  } else if (sigma_a == 0.005 && R_prop == 0.1) {
+    if (h_label == "h1") { R_mult_ekf <- 3792.690;  R_mult_ukf <- 6158.48211 }
+    if (h_label == "h2") { R_mult_ekf <- 6158.482; R_mult_ukf <- 6158.48211 }
+    if (h_label == "h3") { R_mult_ekf <- 3792.690;  R_mult_ukf <- 885.86679 }
+    if (h_label == "h4") { R_mult_ekf <- 6158.482;  R_mult_ukf <- 885.86679 }
+    if (h_label == "h5") { R_mult_ekf <- 10000.000;  R_mult_ukf <- 2335.72147 }
+    
+  } else if (sigma_a == 0.1 && R_prop == 0.01) {
+    if (h_label == "h1") { R_mult_ekf <- 44.06236;    R_mult_ukf <- 1.013 }
+    if (h_label == "h2") { R_mult_ekf <- 37.69391;    R_mult_ukf <- 1.013 }
+    if (h_label == "h3") { R_mult_ekf <- 53.83125;    R_mult_ukf <- 1.013 }
+    if (h_label == "h4") { R_mult_ekf <- 69.95642;    R_mult_ukf <- 1.013 }
+    if (h_label == "h5") { R_mult_ekf <- 53.83125;    R_mult_ukf <- 1.013 }
+    
+  } else if (sigma_a == 0.1 && R_prop == 0.1) {
+    if (h_label == "h1") { R_mult_ekf <- 7.333413;    R_mult_ukf <- 0.9275705 }
+    if (h_label == "h2") { R_mult_ekf <- 10.000000;    R_mult_ukf <- 0.7943282 }
+    if (h_label == "h3") { R_mult_ekf <- 10.000000;    R_mult_ukf <- 0.8808419 }
+    if (h_label == "h4") { R_mult_ekf <- 7.722450;    R_mult_ukf <- 0.8808419 }
+    if (h_label == "h5") { R_mult_ekf <- 10.000000;    R_mult_ukf <- 1.0831632 }
+  }
+
+
+  mse_ekf <- numeric(n_reps)
+mse_ukf <- numeric(n_reps)
+  
+  for (i in 1:n_reps) {
+    #repeat {
+      sim_data <- simulate_flight_1D(x0, n_steps, Q_base)
+    #  if (all(sim_data$px >= 0)) break
+    #}
+
+    sim_data_noisy <- add_noise_1d_h(sim_data, R_scaled = R_prop_scaled, h_label = h_label)
+
+    ekf_result <- run_EKF_1D(
+      sim_data_noisy,
+      Q = Q_base * q_mult_ekf,
+      R = R_mat * R_mult_ekf,
+      x0 = x0,
+      h = h
+    )
+
+    ukf_result <- run_UKF_1D(
+      sim_data = sim_data_noisy,
+      alpha = alpha_fixed,
+      beta = beta_fixed,
+      kappa = kappa_fixed,
+      Q = Q_base * q_mult,
+      R = R_mat * R_mult_ukf ,
+      x0 = x0,
+      h = h
+    )
+
+    mse_ekf[i] <- min(mean((ekf_result$px - sim_data$px)^2), 1000)
+
+    mse_ukf[i] <- min(mean((ukf_result$px - sim_data$px)^2), 1000)
+
+  }
+
+  mean_mse_ekf <- mean(mse_ekf)
+  mean_mse_ukf <- mean(mse_ukf)
+  relative_improvement <- (mean_mse_ekf - mean_mse_ukf) / mean_mse_ekf
+
+  return(c(mean_mse_ekf, mean_mse_ukf, relative_improvement))
+}
+
+  
+  # Run grid search
+  
+  #set.seed(123)
+  for (h_label in h_labels) {
+    for (R_prop in R_prop_values) {
+      for (sigma_a in sigma_a_values) {
+        cat("Processing", h_label, "with R_prop =", R_prop, ", sigma_a =", sigma_a, "\n")
+        
+        result <- evaluate_h_function_grid(h_label, R_prop, sigma_a, n_reps)
+        
+        results_comparison_grid <- rbind(results_comparison_grid, data.frame(
+          h_function = h_label,
+          R_prop = R_prop,
+          sigma_a = sigma_a,
+          MSE_EKF = result[1],
+          MSE_UKF = result[2],
+          Relative_Improvement = result[3],
+          UKF_Advantage = ifelse(result[3] > 0, "UKF Better", "EKF Better")
+        ))
+      }
+    }
+  }
+  
+  # Display results
+  print(results_comparison_grid)
+  
+  kurtosis_info <- data.frame(
+    h_function = h_labels,
+    kurtosis = c(3.0, 2.8, 4.2, 3.5, 6.1)  # Replace with your actual kurtosis values
+  )
+  
+results_with_kurtosis <- merge(results_comparison_grid, kurtosis_info, by = "h_function")
+
+saveRDS(results_with_kurtosis, "results_with_kurtosis_3.rds") # 2 is best so far
+
+  
+
+```
+
+
+## table
+
+```{r}
+
+library(dplyr)
+
+avg_summary <- results_with_kurtosis %>%
+  group_by(sigma_a, R_prop) %>%
+  summarise(
+    avg_MSE_EKF = mean(MSE_EKF),
+    avg_MSE_UKF = mean(MSE_UKF),
+    avg_relative_improvement = mean(Relative_Improvement),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(sigma_a), R_prop)  # optional sorting
+
+
+
+avg_summary
+
+```
+
+
+
+
+## graph
+
+```{r}
+
+# Define parameter grids
+R_prop_values <- c(0.01, 0.1)
+sigma_a_values <- c(0.005, 0.1)
+
+results_comparison_grid2 <- results_comparison_grid
+
+# Create condition variable using results_comparison_grid directly
+results_comparison_grid <- results_comparison_grid2 %>%
+  mutate(
+    condition = case_when(
+      sigma_a == 0.1   & R_prop == 0.01 ~ "1. High Process, Low Measurement",
+      sigma_a == 0.1   & R_prop == 0.1  ~ "2. High Process, High Measurement",
+      sigma_a == 0.005 & R_prop == 0.01 ~ "3. Low Process, Low Measurement",
+      sigma_a == 0.005 & R_prop == 0.1  ~ "4. Low Process, High Measurement",
+      TRUE ~ "Unknown"
+    ),
+    Relative_Improvement = Relative_Improvement   # convert to percent
+  )
+
+# Check what conditions were created
+print("Condition counts:")
+print(table(results_comparison_grid$condition))
+
+# Get the range of values for custom breaks
+min_val <- min(results_comparison_grid$Relative_Improvement)
+max_val <- max(results_comparison_grid$Relative_Improvement)
+
+# Plot with h_functions on x-axis
+ggplot(results_comparison_grid, aes(x = h_function, y = Relative_Improvement)) +
+  geom_point(size = 4, aes(color = Relative_Improvement)) +
+  geom_text(aes(label = h_function), vjust = -0.5, size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.7) +
+  facet_wrap(~ condition, ncol = 2, nrow = 2, scales = "free_y") +
+    scale_color_gradientn(
+      colors = c("orangered", "orangered", "gray80", "blue"),
+      values = scales::rescale(c(-100, -50, 0, 50)),  # -1 and -0.5 share the same color
+      limits = c(-100, 50),
+      oob = scales::squish,                            # clamp < -1 to -1 color, > 0.5 to 0.5 color
+      name = "Performance",
+      breaks = c(-100, 0, 50),
+      labels = c("EKF Better", "", "UKF Better")
+    )+
+  labs(
+    x = "Measurement Function",
+    y = "Relative Improvement"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 10, face = "bold"),
+    plot.title = element_text(size = 14),
+    axis.title = element_text(size = 12),
+    panel.spacing = unit(0.8, "lines"),
+    plot.margin = margin(t = 15, r = 10, b = 10, l = 10, unit = "pt"),
+    legend.position = "right"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_x_discrete(limits = c("h1", "h2", "h3", "h4", "h5"))  # Ensure proper ordering
+
+
+```
+
+## demoed graphs
+
+```{r}
+
+
+library(ggplot2)
+library(dplyr)
+
+# Parameters
+dt <- 1
+n_steps <- 40
+x0 <- c(1000, 2, 0)
+h_label <- "h3"
+h <- measurement_funcs[[h_label]]
+h_inv <- inverse_funcs[[h_label]]
+
+# Grid parameters
+R_prop_values <- c(0.01, 0.1)
+sigma_a_values <- c(0.005, 0.1 )
+
+# Create data for all combinations
+all_plot_data <- data.frame()
+
+for (R_prop in R_prop_values) {
+  for (sigma_a in sigma_a_values) {
+    
+    # Calculate Q matrix based on sigma_a
+    q <- sigma_a^2
+    Q <- matrix(c(
+      (dt^4)/4, (dt^3)/2, (dt^2)/2,
+      (dt^3)/2, dt^2,     dt,
+      (dt^2)/2, dt,       1
+    ), nrow = 3, byrow = TRUE) * q
+    
+    # Generate simulation data
+    #set.seed(2)  # For reproducible results
+    sim_data <- simulate_flight_1D(x0, n_steps, Q)
+    sim_data_noisy <- add_noise_1d_h(sim_data, R_scaled = R_prop*3, h_label = h_label)
+    
+    # Convert measurements back to state space
+    measured_state_space <- h_inv(sim_data_noisy$px_noisy)
+    
+    # Create plot data for this condition
+    plot_df <- data.frame(
+      Time = sim_data$time,
+      True_X = sim_data$px,
+      Measured_X = measured_state_space,
+      R_prop = R_prop,
+      sigma_a = sigma_a,
+      condition = case_when(
+        sigma_a == 0.10 & R_prop == 0.01 ~ "1: High Process, Low Measurement",
+        sigma_a == 0.10 & R_prop == 0.1   ~ "2: High Process, High Measurement", 
+        sigma_a == 0.005 & R_prop == 0.01 ~ "3: Low Process, Low Measurement",
+        sigma_a == 0.005 & R_prop == 0.1   ~ "4: Low Process, High Measurement"
+      )
+    )
+    
+    all_plot_data <- rbind(all_plot_data, plot_df)
+  }
+}
+
+# Create the 2x2 plot
+ggplot(all_plot_data) +
+  geom_path(aes(x = Time, y = True_X, color = "True Trajectory"), 
+            linetype = 2, size = 1, alpha=0.8) +
+  geom_point(aes(x = Time, y = Measured_X, color = "Measurements"), 
+             shape = 4, size = 2, alpha = 1) +
+  facet_wrap(~ condition, ncol = 2, nrow = 2, scales = "free_y") +
+  scale_color_manual(values = c(
+    "True Trajectory" = "black",
+    "Measurements" = "red"
+  )) +
+  labs(
+    title = paste("True Trajectories and Measurements with", h_label, "Function"),
+    subtitle = "Different noise conditions",
+    x = "Time",
+    y = "X Position",
+    color = "Legend"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 10, face = "bold"),
+    plot.title = element_text(size = 14),
+    axis.title = element_text(size = 12),
+    panel.spacing = unit(0.8, "lines"),
+    legend.position = "right"
+  )
+
+```
+
+
+# Varying kurtosis of one function
+
+```{r}
+
+
+library(ggplot2)
+library(dplyr)
+library(moments)  # for skewness and kurtosis
+
+# Parametric measurement function - modify k_param to experiment
+k_param <- 100  # Try different values like 50, 150, 200, 300, etc.
+
+h_variable <- function(x) (x + k_param)^4   
+h_variable_inv <- function(y) sign(y) * abs(y)^(1/4) - k_param
+
+# Test kurtosis with this parameter
+set.seed(42)
+true_x_test <- 5000
+
+# Get measurement-space value
+m_value_test <- true_x_test
+
+# Apply forward transformation
+inv_mean_test <- h_variable(m_value_test)
+sd_test <- 0.2 * abs(inv_mean_test)
+
+# Simulate values near this measurement
+simulated_states_test <- rnorm(50000, mean = inv_mean_test, sd = sd_test)
+
+# Apply inverse to get back to state space
+final_measurements_test <- h_variable_inv(simulated_states_test)
+
+plot_data_test <- data.frame(value = final_measurements_test)
+
+cat(paste0("k_param = ", k_param, " — Skewness: ", round(skewness(final_measurements_test), 3), 
+          ", Kurtosis: ", round(kurtosis(final_measurements_test), 3), "\n"))
+
+print(
+ ggplot(plot_data_test, aes(x = value)) +
+   geom_density(fill = "darkgreen", alpha = 0.7) +
+   theme_minimal(base_size = 14) +
+   labs(
+     title = paste("Variable h Function Distribution (k =", k_param, ")"),
+     subtitle = paste("Kurtosis:", round(kurtosis(final_measurements_test), 3)),
+     x = "Measurement Value",
+     y = "Density"
+   )
+)
+
+k_test_values <- c( 100, 200, 300, 500)
+kurtosis_preview <- data.frame()
+
+for (k_test in k_test_values) {
+ h_temp <- function(x) (x + k_test)^4   
+ h_temp_inv <- function(y) sign(y) * abs(y)^(1/4) - k_test
+ 
+ inv_mean_temp <- h_temp(true_x_test)
+ sd_temp <- 0.2 * abs(inv_mean_temp)
+ simulated_temp <- rnorm(10000, mean = inv_mean_temp, sd = sd_temp)
+ final_temp <- h_temp_inv(simulated_temp)
+ 
+ kurtosis_preview <- rbind(kurtosis_preview, data.frame(
+   k = k_test,
+   kurtosis = kurtosis(final_temp)
+ ))
+}
+
+print("Kurtosis preview across k values:")
+print(kurtosis_preview)
+
+# Plot kurtosis vs k
+print(
+ ggplot(kurtosis_preview, aes(x = k, y = kurtosis)) +
+   geom_point(size = 3, color = "red") +
+   geom_line(color = "red", alpha = 0.6) +
+   theme_minimal(base_size = 14) +
+   labs(
+     title = "Kurtosis vs Parameter k",
+     x = "k parameter",
+     y = "Resulting Kurtosis"
+   )
+)
+```
+
+
+
+
+# Q and R scale values
+
+
+```{r}
+
+
+
+#     R_scales <- seq(0.05, 2, length.out = 10)
+#    sigma_as <- seq(0.01, 0.5, length.out = 10)
+
+
+r_scale <- 2
+sigma_a <- 0.5
+
+
+
+library(dplyr)
+library(ggplot2)
+
+# ---- Fixed parameters ----
+
+dt <- 1
+n_steps <- 60
+x0 <- c(-200, 2, 0, 2000, 5, 0)
+
+q <- sigma_a^2
+
+
+# ---- Q_base (constant acceleration process noise model) ----
+Q_block <- matrix(c(
+  (dt^4)/4, (dt^3)/2, (dt^2)/2,
+  (dt^3)/2, dt^2,     dt,
+  (dt^2)/2, dt,       1
+), nrow = 3, byrow = TRUE) * q
+
+Q_base <- matrix(0, nrow = 6, ncol = 6)
+Q_base[1:3, 1:3] <- Q_block
+Q_base[4:6, 4:6] <- Q_block
+
+# ---- R_base ----
+R_base <- diag(c(50, 50)) * r_scale  # Fixed triangulation noise
+
+# ---- Simulation (fixed) ----
+sim_data <- simulate_flight(x0, n_steps, Q_base)
+
+sim_data_noisy <- add_noise(
+  sim_data,
+  R_tri = R_base,
+  R_radar = diag(c(50, 0.00005)),
+  skewness = 0,
+  normality_weight = 1
+)
+
+# ---- Parameter grid ----
+q_scales <- 10^seq(0, 6, length.out = 30)
+r_scales <- 10^seq(0, 6, length.out = 30)
+param_grid <- expand.grid(Q_scale = q_scales, R_scale = r_scales)
+
+# ---- Storage ----
+results <- expand.grid(
+  Q_scale = q_scales,
+  R_scale = r_scales,
+  Filter = c("EKF", "UKF")
+)
+results$MSE <- NA_real_
+
+# ---- UKF/EKF constants ----
+alpha_fixed <- 0.0001
+beta_fixed  <- 2
+kappa_fixed <- 0
+
+# ---- Loop through each Q/R scale ----
+for (i in seq_len(nrow(param_grid))) {
+  q_mult <- param_grid$Q_scale[i]
+  r_mult <- param_grid$R_scale[i]
+  
+  for (filter_type in c("EKF", "UKF")) {
+    mse_vals <- numeric(10)
+    
+    for (j in seq_len(10)) {
+      if (filter_type == "EKF") {
+        result <- run_EKF(
+          sim_data_noisy,
+          Q = Q_base * q_mult,
+          R = R_base * r_mult,
+          x0 = x0
+        )
+      } else if (filter_type == "UKF") {
+        result <- run_UKF(
+          sim_data_noisy,
+          alpha = alpha_fixed,
+          beta = beta_fixed,
+          kappa = kappa_fixed,
+          Q = Q_base * q_mult,
+          R = R_base * r_mult,
+          x0 = x0
+        )
+      }
+      
+      mse_vals[j] <- mean((result$x - sim_data$px)^2 + (result$y - sim_data$py)^2)
+    }
+    
+    idx <- which(
+      results$Q_scale == q_mult &
+      results$R_scale == r_mult &
+      results$Filter == filter_type
+    )
+    
+    results$MSE[idx] <- mean(mse_vals)
+    
+    cat("✓", filter_type, "| Q =", signif(q_mult, 2),
+        "| R =", signif(r_mult, 2),
+        "→ MSE =", round(results$MSE[idx], 2), "\n")
+  }
+}
+
+
+
+
+```
+
+### graph
+
+```{r}
+
+
+
+library(ggplot2)
+
+
+ggplot(results, aes(x = log10(Q_scale), y = log10(R_scale), fill = MSE)) +
+  geom_tile() +
+  facet_wrap(~ Filter) +
+  scale_fill_viridis_c(trans = "log10") +
+  labs(
+    x = expression(log[10](Q[scale])),
+    y = expression(log[10](R[scale])),
+    fill = "Avg MSE"
+  ) +
+  theme_minimal()
+
+
+
+
+
+```
+
+
+
+
