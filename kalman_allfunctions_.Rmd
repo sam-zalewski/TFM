@@ -5104,7 +5104,7 @@ run_UKF_1D <- function(sim_data, alpha = 1, beta = 0, kappa = 2, Q, R, x0, h) {
   list(px = result$x.f[1, ])  # output filtered x position
 }
 
-  source("EKF_1Dstable.R")
+
 
 run_EKF_1D <- function(sim_data, Q, R, x0, h) {
   dt <- 1
@@ -6651,6 +6651,7 @@ ggplot(results, aes(x = log10(Q_scale), y = log10(R_scale), fill = MSE)) +
 
 
 ```
+
 
 
 
